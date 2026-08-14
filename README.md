@@ -107,7 +107,7 @@ https://dipping-quizzical-ellipse.ngrok-free.dev
 | S.No. | Name | Roll Number |
 |---|---|---|
 | 1 | Rohit Raghuwanshi| 12341820 |
-| 2 | | |
+| 2 | Kabeer Vijay More | 12341030 |
 | 3 | | |
 | 4 | | |
 
