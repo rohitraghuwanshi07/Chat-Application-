@@ -106,7 +106,7 @@ https://dipping-quizzical-ellipse.ngrok-free.dev
 
 | S.No. | Name | Roll Number |
 |---|---|---|
-| 1 | Rohit Raghuwanshi (Group Head) | 12341820 |
+| 1 | Rohit Raghuwanshi| 12341820 |
 | 2 | | |
 | 3 | | |
 | 4 | | |
