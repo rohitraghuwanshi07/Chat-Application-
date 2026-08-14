@@ -65,7 +65,7 @@ This gives you a public HTTPS link that forwards straight to your server, withou
 
 ---
 
-## How It Works (Plain English)
+## How It Works
 
 1. A user opens the web page and enters a username and room name.
 2. The browser opens a WebSocket connection to the server (a one-time "handshake" after which the connection stays open in both directions).
