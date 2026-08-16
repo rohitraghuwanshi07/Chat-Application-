@@ -29,7 +29,7 @@ FRONTEND_DIR = pathlib.Path(__file__).resolve().parent.parent / "frontend"
 
 
 async def index(request):
-    return web.FileResponse(FRONTEND_DIR / "index.html")
+    return web.FileResponse(FRONTEND_DIR / "dist" / "index.html")
 
 
 def create_app():
@@ -44,7 +44,7 @@ def create_app():
 
     app.router.add_get("/", index)
     app.router.add_get("/ws", websocket_handler)
-    app.router.add_static("/static/", FRONTEND_DIR / "static")
+    app.router.add_static("/assets/", FRONTEND_DIR / "dist" / "assets")
 
     return app
 
