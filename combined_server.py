@@ -14,9 +14,34 @@ The server listens on 0.0.0.0:3210 by default.
 
 from aiohttp import web, WSMsgType
 from datetime import datetime
+import sqlite3
 
 # rooms = { room_name: { websocket_connection: username } }
 rooms = {}
+
+# --- Persistence: SQLite database setup ---
+conn = sqlite3.connect("chat.db", check_same_thread=False)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT,
+    sender TEXT,
+    message TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+conn.commit()
+
+
+def save_message(room_id, sender, message):
+    conn.execute(
+        """
+        INSERT INTO messages(room_id, sender, message)
+        VALUES (?, ?, ?)
+        """,
+        (room_id, sender, message)
+    )
+    conn.commit()
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -267,6 +292,7 @@ async def websocket_handler(request):
                     "time": timestamp
                 }
                 print(f"[{room}] {username} ({timestamp}): {msg.data}")
+                save_message(room, username, msg.data)
                 await broadcast(room, payload)
     finally:
         # Runs no matter how the connection ends (tab closed, browser
