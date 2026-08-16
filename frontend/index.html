@@ -1,27 +1,18 @@
-<!DOCTYPE html>
-<html>
-<head>
-<title>WebSocket Chat</title>
-<link rel="stylesheet" href="/static/css/style.css">
-</head>
-<body>
-
-  <div id="setup">
-    <h2>Join Chat</h2>
-    <input id="username" placeholder="Your name">
-    <input id="room" placeholder="Room name (e.g. friends)">
-    <button onclick="joinChat()">Join Chat</button>
-  </div>
-
-  <div id="chatbox">
-    <div id="chat-header">Room: <span id="roomLabel"></span></div>
-    <ul id="messages"></ul>
-    <div id="input-row">
-      <input id="msg" placeholder="Type a message..." onkeydown="if(event.key==='Enter') send()">
-      <button onclick="send()">Send</button>
-    </div>
-  </div>
-
-  <script src="/static/js/app.js"></script>
-</body>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Signed Chat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
 </html>
