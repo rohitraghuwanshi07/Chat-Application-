@@ -15,6 +15,10 @@ The server listens on 0.0.0.0:3210 by default.
 from aiohttp import web, WSMsgType
 from datetime import datetime
 import sqlite3
+import base64
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.exceptions import InvalidSignature
 
 # rooms = { room_name: { websocket_connection: username } }
 rooms = {}
@@ -42,6 +46,80 @@ def save_message(room_id, sender, message):
         (room_id, sender, message)
     )
     conn.commit()
+
+
+def get_history(room_id, limit=50):
+    """Returns the last `limit` messages for a room, oldest first,
+    so a newly-joined user can see what was said before they arrived."""
+    cur = conn.execute(
+        """
+        SELECT sender, message, timestamp FROM messages
+        WHERE room_id = ?
+        ORDER BY id DESC LIMIT ?
+        """,
+        (room_id, limit)
+    )
+    rows = cur.fetchall()
+    rows.reverse()  # oldest first, so they display in the right order
+    history = []
+    for sender, message, ts in rows:
+        # timestamp is stored as full "YYYY-MM-DD HH:MM:SS"; just show the time part
+        time_only = ts.split(" ")[1] if " " in ts else ts
+        history.append({
+            "type": "message",
+            "user": sender,
+            "text": message,
+            "time": time_only,
+            "verified": None  # historical messages weren't signed in this session, so no badge
+        })
+    return history
+
+
+# ---------------------------------------------------------------
+# SIGNING KEYS
+# ---------------------------------------------------------------
+# Each connected user gets their own Ed25519 key pair the moment
+# they join. The private key is used to *sign* every message they
+# send; the public key is used to *verify* that signature, proving
+# the message genuinely came from them and was not altered.
+#
+# client_keys[ws]    -> that connection's private key (used to sign)
+# client_pubkeys[ws] -> that connection's public key (used to verify)
+client_keys = {}
+client_pubkeys = {}
+
+def generate_keypair():
+    """Creates a new Ed25519 private/public key pair for a user."""
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    return private_key, public_key
+
+def sign_message(private_key, text):
+    """Signs the message text with the sender's private key.
+    Returns the signature, base64-encoded so it can be sent as JSON."""
+    signature = private_key.sign(text.encode("utf-8"))
+    return base64.b64encode(signature).decode("utf-8")
+
+def verify_message(public_key, text, signature_b64):
+    """Checks that `signature_b64` really was produced by the holder
+    of `public_key` signing exactly this `text`. Returns True/False."""
+    try:
+        signature = base64.b64decode(signature_b64)
+        public_key.verify(signature, text.encode("utf-8"))
+        return True
+    except (InvalidSignature, Exception):
+        return False
+
+def public_key_fingerprint(public_key):
+    """A short, human-readable stand-in for the full public key,
+    just so the UI/logs can show 'which key' sent a message."""
+    raw = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+    return base64.b64encode(raw).decode("utf-8")[:12]
+
+# ---------------------------------------------------------------
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -141,6 +219,10 @@ HTML_PAGE = """
     opacity: 0.7;
     margin-top: 3px;
   }
+  .verified {
+    color: #22c55e;
+    font-weight: 600;
+  }
   #input-row {
     display: flex;
     padding: 10px;
@@ -211,9 +293,10 @@ HTML_PAGE = """
       li.textContent = data.text;
     } else {
       li.className = data.user === myName ? "me" : "";
+      const badge = data.verified ? ' <span class="verified">&#10003; verified</span>' : "";
       li.innerHTML = (data.user !== myName ? "<b>" + data.user + "</b><br>" : "") +
                      data.text +
-                     '<span class="meta">' + data.time + '</span>';
+                     '<span class="meta">' + data.time + badge + '</span>';
     }
     document.getElementById("messages").appendChild(li);
     document.getElementById("messages").scrollTop = document.getElementById("messages").scrollHeight;
@@ -274,7 +357,18 @@ async def websocket_handler(request):
         rooms[room] = {}
     rooms[room][ws] = username
 
+    # Give this user their own signing key pair for this session
+    private_key, public_key = generate_keypair()
+    client_keys[ws] = private_key
+    client_pubkeys[ws] = public_key
+
     print(f"[{room}] {username} joined. Total in room: {len(rooms[room])}")
+    print(f"[{room}] {username}'s public key fingerprint: {public_key_fingerprint(public_key)}")
+
+    # Send this user the previous chat history for the room (only to them,
+    # not broadcast to everyone else, since they're the only one who needs it)
+    for old_message in get_history(room):
+        await ws.send_json(old_message)
 
     await broadcast(room, {
         "type": "system",
@@ -285,19 +379,37 @@ async def websocket_handler(request):
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 timestamp = datetime.now().strftime("%H:%M:%S")
+
+                # Sign this message with the sender's private key
+                signature = sign_message(private_key, msg.data)
+
+                # Verify it right away using their public key -- this is
+                # the same check any recipient could independently perform
+                # to confirm the message is genuine and unaltered.
+                is_verified = verify_message(public_key, msg.data, signature)
+                if not is_verified:
+                    print(f"[{room}] WARNING: signature verification FAILED for a message from {username} -- message dropped")
+                    continue  # don't broadcast or save a message that fails verification
+
                 payload = {
                     "type": "message",
                     "user": username,
                     "text": msg.data,
-                    "time": timestamp
+                    "time": timestamp,
+                    "signature": signature,
+                    "key_fingerprint": public_key_fingerprint(public_key),
+                    "verified": is_verified
                 }
-                print(f"[{room}] {username} ({timestamp}): {msg.data}")
+                print(f"[{room}] {username} ({timestamp}): {msg.data}  [signature verified: {is_verified}]")
                 save_message(room, username, msg.data)
                 await broadcast(room, payload)
     finally:
         # Runs no matter how the connection ends (tab closed, browser
         # crashed, network dropped) -- this is our graceful
         # disconnect handling.
+        client_keys.pop(ws, None)
+        client_pubkeys.pop(ws, None)
+
         if room in rooms and ws in rooms[room]:
             del rooms[room][ws]
             print(f"[{room}] {username} left. Total in room: {len(rooms[room])}")
