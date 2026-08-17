@@ -117,7 +117,7 @@ Private signing keys are currently generated and held **server-side** (per usern
 
 | S.No. | Name | Roll Number |
 |---|---|---|
-| 1 | Lakshay Gupta (Group Head) | 12341300 |
+| 1 | Lakshay Gupta | 12341300 |
 | 2 | Kabeer Vijay More | 12341030 |
 | 3 | Rathod Chetan Kumar | 12341750 |
 | 4 | Rohit Raghuwanshi | 12341820 |
