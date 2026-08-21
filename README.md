@@ -35,28 +35,6 @@ A real-time WebSocket group chat application, extended with persistent storage, 
 
 ---
 
-## How to Run
-
-1. Install dependencies:
-```bash
-   pip install aiohttp cryptography
-```
-
-2. Start the server:
-```bash
-   python3 combined_server.py
-```
-   Server runs on `http://0.0.0.0:3302` by default.
-
-3. Open in a browser:
-http://localhost:3302
-   or from another device on the same network:
-http://<server-ip>:3302
-
-4. Enter a username and room name, then join. Open the same link in another tab/device with the same room name to chat with others in real time.
-
----
-
 ## Database Schema
 
 ```sql
