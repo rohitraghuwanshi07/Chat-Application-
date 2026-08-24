@@ -22,7 +22,16 @@ export function useChatSocket() {
     socket.onclose = () => setConnected(false)
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data)
-      setMessages((prev) => [...prev, { ...data, id: crypto.randomUUID() }])
+      setMessages((prev) => [
+  ...prev,
+  {
+    ...data,
+    id:
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  },
+])
     }
 
     socketRef.current = socket
