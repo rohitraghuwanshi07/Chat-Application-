@@ -144,9 +144,12 @@ async def websocket_handler(request):
                     "type": "message", "user": username, "text": plaintext,
                     "time": timestamp, "verified": verified,
                 })
+    except Exception as e:
+        print(f"[{room}] {username} connection ERRORED: {e!r}")
     finally:
+        print(f"[{room}] {username} loop ended. ws.closed={ws.closed} "
+              f"close_code={ws.close_code} exception={ws.exception()!r}")
         rooms.get(room, {}).pop(ws, None)
         print(f"[{room}] {username} left. Total in room: {len(rooms.get(room, {}))}")
         await broadcast(room, {"type": "system", "text": f"{username} left the room"})
-
     return ws
