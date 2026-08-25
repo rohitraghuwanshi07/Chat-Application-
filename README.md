@@ -1,4 +1,4 @@
-markdown
+
 # Secure Persistent Group Chat
 
 A real-time WebSocket group chat application, extended with persistent storage, encryption, and cryptographic message signing/verification.
