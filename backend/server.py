@@ -113,4 +113,4 @@ def create_app():
 
 
 if __name__ == "__main__":
-    web.run_app(app, host=HOST, port=PORT)
+    web.run_app(create_app(), host=HOST, port=PORT)
