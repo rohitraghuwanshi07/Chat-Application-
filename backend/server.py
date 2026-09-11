@@ -1,22 +1,3 @@
-"""
-server.py
-----------
-Entry point. This is the ONLY file you run. It just wires the pieces
-together:
-
-    database.py       -> where messages/keys are stored
-    crypto_utils.py    -> signing + encryption
-    chat_handler.py     -> live websocket behavior
-    frontend/           -> the static HTML/CSS/JS the browser loads
-
-Run with:
-    cd backend
-    python3 server.py
-
-Then open http://localhost:3210 in a browser (open it twice / in two
-tabs to chat with "yourself").
-"""
-
 import pathlib
 from aiohttp import web
 from cryptography.fernet import Fernet
