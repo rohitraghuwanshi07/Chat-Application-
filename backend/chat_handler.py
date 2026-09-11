@@ -1,19 +1,4 @@
-"""
-chat_handler.py
------------------
-The live part of the app: who is connected to which room, sending a
-message to everyone in that room, and the pipeline a new chat message
-goes through before it's saved:
-
-    plaintext  --sign-->  signature
-    plaintext  --encrypt-->  ciphertext
-    (ciphertext, signature)  --saved to DB--
-
-And in reverse, when history loads:
-
-    ciphertext  --decrypt-->  plaintext
-    (plaintext, signature)  --verify-->  True/False "verified" badge
-"""
+#Encrypt messages when recieving, and decrypt when reading
 
 from datetime import datetime
 from aiohttp import web, WSMsgType
@@ -116,7 +101,7 @@ async def websocket_handler(request):
     print(f"[{room}] {username} joined. Total in room: {len(rooms[room])}")
     await broadcast(room, {"type": "system", "text": f"{username} joined the room"})
 
-    # Send this client the room's history, decrypted + re-verified live.
+    # Send this client the room's history, decrypted.
     for old_payload in build_history_payloads(conn, fernet, room):
         await ws.send_json(old_payload)
 
@@ -137,8 +122,7 @@ async def websocket_handler(request):
 
                 print(f"[{room}] {username} ({timestamp}): signed & encrypted, verified={verified}")
 
-                # Live broadcast carries PLAINTEXT (these clients are
-                # already inside an authenticated live session) -- only
+                # Live broadcast carries PLAINTEXT
                 # what touches the DATABASE is encrypted.
                 await broadcast(room, {
                     "type": "message", "user": username, "text": plaintext,
