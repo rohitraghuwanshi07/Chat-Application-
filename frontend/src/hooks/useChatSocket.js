@@ -1,42 +1,89 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { getOrCreateIdentity, signText } from '../lib/identity.js'
+
+function makeId() {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
 
 /**
  * Owns the WebSocket connection and the list of messages/system events
  * received over it. Talks to the SAME backend routes the old vanilla-JS
  * frontend did (`/ws?name=...&room=...`) -- only the client changed.
+ *
+ * CHANGED: every outgoing chat message now carries a client-generated
+ * message_id. If the socket drops before we're sure a message landed,
+ * we resend it (same message_id) after reconnecting -- the backend's
+ * unique-message_id constraint makes that resend a safe no-op if the
+ * original actually made it through, instead of creating a duplicate.
+ *
+ * CHANGED: the server no longer generates or holds signing keys. This
+ * hook now loads/generates this browser's Ed25519 identity for the
+ * given username (see lib/identity.js), registers its public key with
+ * the server once at connect time (?pubkey=... on the WS URL), and
+ * signs every outgoing message itself before sending it.
  */
 export function useChatSocket() {
   const [messages, setMessages] = useState([])
   const [connected, setConnected] = useState(false)
   const socketRef = useRef(null)
+  const nameRef = useRef('')
+  const identityRef = useRef(null) // { privateKey, publicKeyPem }
+  // message_id -> text, for messages we've sent but haven't seen echoed
+  // back to us yet. Cleared as soon as the matching broadcast arrives.
+  const pendingRef = useRef(new Map())
 
-  const connect = useCallback((name, room) => {
+  const connect = useCallback(async (name, room) => {
+    nameRef.current = name
+    identityRef.current = await getOrCreateIdentity(name)
+
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const url =
       `${proto}://${location.host}/ws` +
-      `?name=${encodeURIComponent(name)}&room=${encodeURIComponent(room)}`
+      `?name=${encodeURIComponent(name)}&room=${encodeURIComponent(room)}` +
+      `&pubkey=${encodeURIComponent(identityRef.current.publicKeyPem)}`
 
     const socket = new WebSocket(url)
 
-    socket.onopen = () => setConnected(true)
+    socket.onopen = () => {
+      setConnected(true)
+      // Retry: resend anything sent before this connection existed that
+      // never got confirmed. Same message_id each time, so the server
+      // just ignores it if it actually already has that message.
+      for (const [message_id, text] of pendingRef.current) {
+        signText(identityRef.current.privateKey, text).then((signature) => {
+          socket.send(JSON.stringify({ text, message_id, signature }))
+        })
+      }
+    }
     socket.onclose = () => setConnected(false)
     socket.onmessage = (event) => {
-       const data = JSON.parse(event.data)
+      const data = JSON.parse(event.data)
 
-       const id =
-          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-             ? crypto.randomUUID()
-             : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      if (data.message_id && data.user === nameRef.current) {
+        pendingRef.current.delete(data.message_id)
+      }
 
-         setMessages((prev) => [...prev, { ...data, id }])
-}
+      const id = data.message_id ?? makeId()
+
+      setMessages((prev) => {
+        // Guard against ever rendering the same message twice (e.g. a
+        // retry that lands as both a direct ack and a room broadcast).
+        if (data.message_id && prev.some((m) => m.id === id)) return prev
+        return [...prev, { ...data, id }]
+      })
+    }
     socketRef.current = socket
   }, [])
 
-  const sendMessage = useCallback((text) => {
+  const sendMessage = useCallback(async (text) => {
     const socket = socketRef.current
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(text)
+    if (socket && socket.readyState === WebSocket.OPEN && identityRef.current) {
+      const message_id = makeId()
+      pendingRef.current.set(message_id, text)
+      const signature = await signText(identityRef.current.privateKey, text)
+      socket.send(JSON.stringify({ text, message_id, signature }))
     }
   }, [])
 
