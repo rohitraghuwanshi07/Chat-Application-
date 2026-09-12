@@ -1,165 +1,136 @@
 """
 database.py
 ------------
-ONLY job: talk to PostgreSQL. Nothing in here knows about encryption or
-signatures -- it just stores and retrieves whatever strings it's given.
-
-This is the plain/basic Postgres version: one connection, no pooling,
-no replicas, no sharding. It exists to prove the migration works before
-adding any performance optimizations.
-
-WHY SEPARATE FILE:
-Everything else in the app (server.py, chat_handler.py) only calls the
-functions below -- it never talks to the database directly. That's why
-swapping SQLite for PostgreSQL only required editing this one file.
-
-CONNECTION:
-Set these via environment variables (all have local defaults so it
-runs out of the box against a local Postgres install):
-
-    DB_HOST      (default: localhost)
-    DB_PORT      (default: 5432)
-    DB_NAME      (default: chatdb)
-    DB_USER      (default: postgres)
-    DB_PASSWORD  (default: postgres)
+Async Postgres client (asyncpg + connection pool) talking to an
+EXTERNALLY hosted database -- not one of your 4 allotted containers.
+asyncpg is used (not psycopg2) because psycopg2 is blocking: a
+blocking DB call inside an aiohttp handler freezes the entire event
+loop for every other concurrent request on that node. asyncpg is
+non-blocking and pools connections, which matters once your load
+generator ramps concurrency.
 """
-
 import os
-import uuid
-import psycopg2
-import psycopg2.extras
+import asyncpg
+from dotenv import load_dotenv
+from cryptography.fernet import Fernet
 
-DB_HOST = os.environ.get("DB_HOST", "localhost")
-DB_PORT = os.environ.get("DB_PORT", "5432")
-DB_NAME = os.environ.get("DB_NAME", "chatdb")
-DB_USER = os.environ.get("DB_USER", "postgres")
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "postgres")
+load_dotenv()
+
+DB_HOST = os.environ.get("CHAT_DB_HOST")
+DB_PORT = int(os.environ.get("CHAT_DB_PORT", "5432"))
+DB_NAME = os.environ.get("CHAT_DB_NAME")
+DB_USER = os.environ.get("CHAT_DB_USER")
+DB_PASS = os.environ.get("CHAT_DB_PASS")
 
 
-def get_connection():
-    """Opens a connection to the shared Postgres database."""
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
+async def get_connection():
+    """Returns a connection POOL (kept as 'conn' for call-site
+    compatibility with the rest of the app)."""
+    return await asyncpg.create_pool(
+        host=DB_HOST, port=DB_PORT, database=DB_NAME,
+        user=DB_USER, password=DB_PASS,
+        min_size=2, max_size=10,
     )
 
 
-def init_db(conn):
-    """Creates the two tables we need, if they don't already exist."""
-
-    cursor = conn.cursor()
-
-    # `ciphertext` -- NOT `message` -- because we never store plaintext.
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
-        id                  SERIAL PRIMARY KEY,
-        message_id          TEXT UNIQUE,
-        room_id             TEXT NOT NULL,
-        sender              TEXT NOT NULL,
-        ciphertext          TEXT NOT NULL,
-        signature           TEXT NOT NULL,
-        timestamp           TIMESTAMPTZ DEFAULT NOW(),
-        verified_at_insert  BOOLEAN NOT NULL
-    )
-    """)
-
-    # One row per username: their permanent PUBLIC key. Private keys are
-    # never written here -- see crypto_utils.py for why.
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS signers (
-        username        TEXT PRIMARY KEY,
-        public_key_pem  TEXT NOT NULL
-    )
-    """)
-
-    conn.commit()
-    cursor.close()
+async def init_db(pool):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id                  SERIAL PRIMARY KEY,
+            msg_id              TEXT UNIQUE NOT NULL,
+            room_id             TEXT NOT NULL,
+            sender              TEXT NOT NULL,
+            ciphertext          TEXT NOT NULL,
+            signature           TEXT NOT NULL,
+            timestamp           TIMESTAMP DEFAULT now(),
+            verified_at_insert  BOOLEAN NOT NULL
+        )
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS signers (
+            username         TEXT PRIMARY KEY,
+            public_key_pem   TEXT NOT NULL,
+            private_key_pem  TEXT NOT NULL
+        )
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS server_secret (
+            id INT PRIMARY KEY DEFAULT 1,
+            fernet_key TEXT NOT NULL
+        )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id)")
 
 
-def save_message(conn, room_id, sender, ciphertext, signature, verified_at_insert, message_id=None):
-    """Saves a message with deduplication by message_id.
-    Returns (message_id, inserted).
-
-    ON CONFLICT DO NOTHING is what guarantees no duplicate rows even if
-    the same message_id is sent twice (retry, reconnect, etc.) -- the
-    database enforces this, not the application.
-    """
-    if not message_id:
-        message_id = str(uuid.uuid4())
-
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO messages (message_id, room_id, sender, ciphertext, signature, verified_at_insert)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (message_id) DO NOTHING
-        """,
-        (message_id, room_id, sender, ciphertext, signature, verified_at_insert),
-    )
-    conn.commit()
-    inserted = cursor.rowcount > 0
-    cursor.close()
-    return message_id, inserted
+async def save_message(pool, msg_id, room_id, sender, ciphertext, signature, verified_at_insert):
+    """Idempotent insert -- duplicate msg_id is silently ignored."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO messages (msg_id, room_id, sender, ciphertext, signature, verified_at_insert)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (msg_id) DO NOTHING
+            """,
+            msg_id, room_id, sender, ciphertext, signature, verified_at_insert,
+        )
 
 
-def load_room_messages(conn, room_id):
-    """Returns (message_id, sender, ciphertext, signature, timestamp) for every
-    message in a room, oldest first."""
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT COALESCE(message_id, CAST(id AS TEXT)), sender, ciphertext, signature, timestamp
-        FROM messages
-        WHERE room_id = %s
-        ORDER BY id
-        """,
-        (room_id,),
-    )
-    rows = cursor.fetchall()
-    cursor.close()
-    return rows
+async def load_room_messages(pool, room_id):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT sender, ciphertext, signature, timestamp FROM messages WHERE room_id = $1 ORDER BY id",
+            room_id,
+        )
+        return [(r["sender"], r["ciphertext"], r["signature"], r["timestamp"]) for r in rows]
 
 
-def load_all_messages(conn):
-    """Returns (message_id, sender, ciphertext, room_id, timestamp) for
-    EVERY message across ALL rooms, oldest first. Used by the /feed
-    REST endpoint, which (unlike the websocket chat) isn't scoped to a
-    single room."""
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT COALESCE(message_id, CAST(id AS TEXT)), sender, ciphertext, room_id, timestamp
-        FROM messages
-        ORDER BY id
-        """
-    )
-    rows = cursor.fetchall()
-    cursor.close()
-    return rows
+async def load_all_messages(pool):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT msg_id, room_id, sender, ciphertext, signature, timestamp FROM messages ORDER BY id"
+        )
+        return [
+            (r["msg_id"], r["room_id"], r["sender"], r["ciphertext"], r["signature"], r["timestamp"])
+            for r in rows
+        ]
 
 
-def save_public_key(conn, username, public_key_pem):
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO signers (username, public_key_pem) VALUES (%s, %s)
-        ON CONFLICT (username) DO UPDATE SET public_key_pem = EXCLUDED.public_key_pem
-        """,
-        (username, public_key_pem),
-    )
-    conn.commit()
-    cursor.close()
+async def save_signing_key(pool, username, public_key_pem, private_key_pem):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO signers (username, public_key_pem, private_key_pem)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (username) DO NOTHING
+            """,
+            username, public_key_pem, private_key_pem,
+        )
 
 
-def load_public_key(conn, username):
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT public_key_pem FROM signers WHERE username = %s",
-        (username,),
-    )
-    row = cursor.fetchone()
-    cursor.close()
-    return row[0] if row else None
+async def load_signing_key(pool, username):
+    """Returns (public_key_pem, private_key_pem) or None."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT public_key_pem, private_key_pem FROM signers WHERE username = $1", username
+        )
+        return (row["public_key_pem"], row["private_key_pem"]) if row else None
+
+
+async def get_or_create_fernet_key(pool):
+    """One shared Fernet key for the whole cluster, stored in the DB
+    instead of a local file -- so every backend node can decrypt
+    every other node's ciphertext."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT fernet_key FROM server_secret WHERE id = 1")
+        if row:
+            return row["fernet_key"].encode()
+
+        key = Fernet.generate_key()
+        await conn.execute(
+            "INSERT INTO server_secret (id, fernet_key) VALUES (1, $1) ON CONFLICT (id) DO NOTHING",
+            key.decode(),
+        )
+        # Re-fetch in case two nodes started at the same instant and raced.
+        row = await conn.fetchrow("SELECT fernet_key FROM server_secret WHERE id = 1")
+        return row["fernet_key"].encode()
