@@ -29,8 +29,8 @@ import uuid
 import psycopg2
 import psycopg2.extras
 
-DB_HOST = "10.1.75.79"
-DB_PORT = "3214"
+DB_HOST = "172.17.0.15"
+DB_PORT = "3000"
 DB_NAME = "chatdb"
 DB_USER = "chatuser"
 DB_PASSWORD = "password"

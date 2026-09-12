@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getOrCreateIdentity, signText } from '../lib/identity.js'
+// BYPASS (temporary): getOrCreateIdentity/signText disabled below, see notes.
+// import { getOrCreateIdentity, signText } from '../lib/identity.js'
 
 function makeId() {
   return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -36,13 +37,17 @@ export function useChatSocket() {
 
   const connect = useCallback(async (name, room) => {
     nameRef.current = name
-    identityRef.current = await getOrCreateIdentity(name)
+    // BYPASS (temporary): getOrCreateIdentity() needs crypto.subtle, which
+    // browsers disable on insecure (non-HTTPS, non-localhost) origins.
+    // Skipping it means messages send unsigned -- verified will show as
+    // false, but the app will actually connect. Restore this once served
+    // over HTTPS or localhost.
+    // identityRef.current = await getOrCreateIdentity(name)
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const url =
       `${proto}://${location.host}/ws` +
-      `?name=${encodeURIComponent(name)}&room=${encodeURIComponent(room)}` +
-      `&pubkey=${encodeURIComponent(identityRef.current.publicKeyPem)}`
+      `?name=${encodeURIComponent(name)}&room=${encodeURIComponent(room)}`
 
     const socket = new WebSocket(url)
 
@@ -52,9 +57,8 @@ export function useChatSocket() {
       // never got confirmed. Same message_id each time, so the server
       // just ignores it if it actually already has that message.
       for (const [message_id, text] of pendingRef.current) {
-        signText(identityRef.current.privateKey, text).then((signature) => {
-          socket.send(JSON.stringify({ text, message_id, signature }))
-        })
+        // BYPASS (temporary): see note above -- sending with no signature.
+        socket.send(JSON.stringify({ text, message_id, signature: '' }))
       }
     }
     socket.onclose = () => setConnected(false)
@@ -79,10 +83,11 @@ export function useChatSocket() {
 
   const sendMessage = useCallback(async (text) => {
     const socket = socketRef.current
-    if (socket && socket.readyState === WebSocket.OPEN && identityRef.current) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
       const message_id = makeId()
       pendingRef.current.set(message_id, text)
-      const signature = await signText(identityRef.current.privateKey, text)
+      // BYPASS (temporary): see note above -- sending with no signature.
+      const signature = ''
       socket.send(JSON.stringify({ text, message_id, signature }))
     }
   }, [])
