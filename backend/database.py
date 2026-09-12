@@ -29,11 +29,11 @@ import uuid
 import psycopg2
 import psycopg2.extras
 
-DB_HOST = "172.17.0.15"
-DB_PORT = "3000"
-DB_NAME = "chatdb"
-DB_USER = "chatuser"
-DB_PASSWORD = "password"
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_PORT = os.environ.get("DB_PORT", "5432")
+DB_NAME = os.environ.get("DB_NAME", "chatdb")
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "postgres")
 
 
 def get_connection():
@@ -117,6 +117,24 @@ def load_room_messages(conn, room_id):
         ORDER BY id
         """,
         (room_id,),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
+def load_all_messages(conn):
+    """Returns (message_id, sender, ciphertext, room_id, timestamp) for
+    EVERY message across ALL rooms, oldest first. Used by the /feed
+    REST endpoint, which (unlike the websocket chat) isn't scoped to a
+    single room."""
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COALESCE(message_id, CAST(id AS TEXT)), sender, ciphertext, room_id, timestamp
+        FROM messages
+        ORDER BY id
+        """
     )
     rows = cursor.fetchall()
     cursor.close()
