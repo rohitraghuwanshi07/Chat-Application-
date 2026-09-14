@@ -2,96 +2,98 @@
 replication.py
 ----------------
 Tiny "active-active" fan-out for the local Valkey instances.
-
-Valkey (like Postgres, like Dragonfly) only does primary->replica
-replication out of the box -- not true multi-master. But this app's
-data doesn't need real multi-master conflict resolution: messages are
-immutable and uniquely keyed by message_id, so two backends can never
-disagree about what a given message_id means. That means a much
-simpler trick works fine:
-
-  1. A backend saves a NEW message to its own local Valkey.
-  2. It fires this same message at its peer backends' /replicate route.
-  3. Each peer applies it to ITS OWN local Valkey via the exact same
-     save_message() dedup path -- so applying it twice, out of order,
-     or after a delay is always a safe no-op.
-
-End result: every backend ends up holding the full dataset, so /feed
-and room-history reads are always 100% local -- no network hop, no
-shared bottleneck, and read throughput scales linearly as you add more
-backends.
-
-EDIT PEERS BELOW -- list this machine's OTHER backends, not itself.
-Example for Sys2 (leave Sys2 itself out of its own list):
-    PEERS = ["http://SYS3:4000", "http://SYS4:4000"]
-
-CHANGED (perf fix): fanout() used to open a brand-new
-aiohttp.ClientSession -- and therefore brand-new TCP connections to
-every peer -- on EVERY SINGLE MESSAGE. Under load that meant hundreds
-of fresh connection setups per second on top of the actual traffic,
-which is what was starving the backends and causing them to time out
-reaching each other. Now there's exactly ONE session, created once at
-app startup (see server.py's on_startup/on_cleanup hooks) and reused
-by every call, so peer connections are pooled and kept warm instead of
-being rebuilt from scratch each time.
+ 
+CHANGED (backpressure fix): every accepted message used to spawn an
+independent asyncio.create_task(fanout(...)) with no limit on how many
+could be in flight at once. Under load, if a peer was even briefly slow
+to respond, fanout tasks (each holding a message's ciphertext/signature
+in memory until it times out) piled up faster than they drained -- a
+classic unbounded backlog. That's what was driving memory from ~56MB to
+the container's ~512MB cap over a few minutes: not a leak in the usual
+sense, but a queue with no ceiling.
+ 
+Two changes fix this:
+  1. A semaphore caps how many fanout operations can be in flight at
+     once. Once full, new fanout calls skip immediately (logged, not
+     queued) instead of adding to the backlog -- a peer being briefly
+     behind should mean "slightly stale," never "unbounded memory
+     growth."
+  2. Peers are contacted concurrently (asyncio.gather) instead of one
+     after another, and the timeout is shorter, so each fanout call
+     resolves quickly either way instead of tying up memory for up to
+     4+ seconds per message under a sequential loop.
 """
-
+ 
+import asyncio
 import aiohttp
-
+ 
 PEERS = [
     "http://172.17.0.xx:4000",
     "http://172.17.0.xx:4000",
 ]
-
-_FANOUT_TIMEOUT = aiohttp.ClientTimeout(total=2)
-
-# Set once by init_session() at app startup. Deliberately module-level
-# (rather than passed through every call site) so existing callers of
-# fanout(payload) don't need to change.
+ 
+# Shorter per-peer timeout: on a local/fast network, 2s was generous
+# enough to let slow peers hold a fanout call open for a long time.
+_FANOUT_TIMEOUT = aiohttp.ClientTimeout(total=1)
+ 
+# Hard cap on concurrent fanout operations. Tune this against your own
+# machine's memory budget -- 200 is a conservative starting point for
+# a container with a few hundred MB to spare after the app itself.
+_MAX_CONCURRENT_FANOUTS = 200
+_fanout_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_FANOUTS)
+ 
 _session: aiohttp.ClientSession | None = None
-
-
+ 
+# Visibility: how many fanouts we've had to skip because we were
+# already at capacity. If this climbs during a run, peers are falling
+# behind and it's worth knowing, even though it no longer costs memory.
+_skipped_count = 0
+ 
+ 
 def init_session():
-    """Creates the single shared ClientSession used by every fanout()
-    call for the lifetime of the process. Must be called once, from an
-    async context, before the first fanout() call -- server.py does
-    this in an on_startup hook. Reusing one session means peer
-    connections are pooled and kept alive instead of being opened and
-    torn down for every message."""
     global _session
     _session = aiohttp.ClientSession(timeout=_FANOUT_TIMEOUT)
-
-
+ 
+ 
 async def close_session():
-    """Cleanly closes the shared session's connections. Call this from
-    an on_cleanup hook so the process doesn't leak sockets on shutdown."""
     global _session
     if _session is not None:
         await _session.close()
         _session = None
-
-
+ 
+ 
+async def _send_to_peer(peer: str, payload: dict):
+    try:
+        async with _session.post(f"{peer}/replicate", json=payload) as resp:
+            await resp.read()
+    except Exception as e:
+        print(f"[replicate] failed to reach {peer}: {e!r}")
+ 
+ 
 async def fanout(payload: dict):
-    """Fire-and-forget: tells every peer to apply this same message
-    locally. Never raises -- a peer being briefly unreachable just
-    means it's slightly behind until the next successful fan-out; it
-    never fails the original request that's already been saved and
-    answered locally.
-
-    Uses the shared module-level session (see init_session()) instead
-    of creating a new one per call.
+    """Fire-and-forget, but bounded: if we're already at
+    _MAX_CONCURRENT_FANOUTS in-flight fanout operations, this call
+    drops immediately instead of adding to an unbounded backlog.
     """
+    global _skipped_count
+ 
     if _session is None:
-        # init_session() wasn't called -- fail loudly in the log so this
-        # doesn't silently no-op replication, but don't raise (fan-out
-        # must never break the caller's already-completed request).
         print("[replicate] no session initialized -- did server.py call "
               "replication.init_session() on startup?")
         return
-
-    for peer in PEERS:
-        try:
-            async with _session.post(f"{peer}/replicate", json=payload) as resp:
-                await resp.read()
-        except Exception as e:
-            print(f"[replicate] failed to reach {peer}: {e!r}")
+ 
+    if _fanout_semaphore.locked():
+        _skipped_count += 1
+        if _skipped_count % 100 == 1:  # don't spam the log
+            print(f"[replicate] at capacity ({_MAX_CONCURRENT_FANOUTS} "
+                  f"in-flight), skipped {_skipped_count} fanouts so far")
+        return
+ 
+    async with _fanout_semaphore:
+        # Contact all peers concurrently instead of one after another --
+        # bounds worst-case time per fanout to ~_FANOUT_TIMEOUT, not
+        # _FANOUT_TIMEOUT * len(PEERS).
+        await asyncio.gather(
+            *(_send_to_peer(peer, payload) for peer in PEERS),
+            return_exceptions=True,
+        )
