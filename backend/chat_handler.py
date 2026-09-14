@@ -7,7 +7,8 @@ goes through before it's saved:
 
     plaintext + signature  <-- arrives from the client, already signed
     plaintext  --encrypt-->  ciphertext
-    (ciphertext, signature)  --saved to DB--
+    (ciphertext, signature)  --saved to local Valkey--
+    new (non-duplicate) message --> fanned out to peer backends too
 
 And in reverse, when history loads:
 
@@ -19,23 +20,32 @@ Each browser generates its own Ed25519 keypair (see
 frontend/src/lib/identity.js), signs its own messages, and sends its
 public key once at connect time. The server's job shrank to exactly
 what it should be: verify a signature it was given, never produce one.
+
+CHANGED (Valkey + active-active): `pool` everywhere below is a Valkey
+connection pool (see database.py) for THIS backend's own local
+instance. Every database.* call is wrapped in `await
+database.run_async(...)` to keep it off the event loop, and every
+newly-saved (non-duplicate) message is fanned out to peer backends
+(see replication.py) so they end up holding the same data locally too.
 """
 
 import json
 import uuid
+import asyncio
 from datetime import datetime
 from aiohttp import web, WSMsgType
 from cryptography.fernet import Fernet
 
 import crypto_utils
 import database
+import replication
 
 # rooms = { room_name: { websocket_object: username } }
 rooms = {}
 
 
-def get_verifier_public_key(conn, username):
-    pem = database.load_public_key(conn, username)
+async def get_verifier_public_key(pool, username):
+    pem = await database.run_async(database.load_public_key, pool, username)
     return crypto_utils.pem_to_public_key(pem) if pem else None
 
 
@@ -54,7 +64,7 @@ async def broadcast(room, payload, exclude=None):
         rooms.get(room, {}).pop(dead, None)
 
 
-def build_history_payloads(conn, fernet: Fernet, room_id):
+async def build_history_payloads(pool, fernet: Fernet, room_id):
     """
     Loads every stored message for a room and, for EACH ONE, decrypts it
     and re-checks its signature RIGHT NOW rather than trusting whatever
@@ -62,15 +72,13 @@ def build_history_payloads(conn, fernet: Fernet, room_id):
     up even after a server restart: if a row was edited directly in the
     database, this re-check will now disagree with the original result.
     """
-    rows = database.load_room_messages(conn, room_id)
+    rows = await database.run_async(database.load_room_messages, pool, room_id)
     payloads = []
 
     for message_id, sender, ciphertext, signature, timestamp in rows:
         plaintext = crypto_utils.decrypt_text(fernet, ciphertext)
 
         if plaintext is None:
-            # Fernet's own integrity check caught corruption before we
-            # even got to look at the Ed25519 signature.
             payloads.append({
                 "type": "message", "user": sender,
                 "text": "[message unreadable -- storage was tampered with]",
@@ -78,7 +86,7 @@ def build_history_payloads(conn, fernet: Fernet, room_id):
             })
             continue
 
-        public_key = get_verifier_public_key(conn, sender)
+        public_key = await get_verifier_public_key(pool, sender)
         verified_now = crypto_utils.verify_signature(public_key, plaintext, signature)
         payloads.append({
             "type": "message", "user": sender, "text": plaintext,
@@ -89,7 +97,7 @@ def build_history_payloads(conn, fernet: Fernet, room_id):
 
 
 async def websocket_handler(request):
-    conn = request.app["db_conn"]
+    pool = request.app["db_conn"]
     fernet = request.app["fernet"]
 
     ws = web.WebSocketResponse()
@@ -101,20 +109,14 @@ async def websocket_handler(request):
 
     rooms.setdefault(room, {})[ws] = username
 
-    # The client generated its own keypair and is telling us its public
-    # half. We just store whatever we're given (no first-write-wins
-    # check -- impersonation-by-name is a known, separate limitation of
-    # this app having no login system, left as out of scope for now).
-    # An old client that doesn't send ?pubkey= simply won't verify --
-    # there's no server-side key to fall back to signing with anymore.
     if pubkey_pem:
-        database.save_public_key(conn, username, pubkey_pem)
+        await database.run_async(database.save_public_key, pool, username, pubkey_pem)
 
     print(f"[{room}] {username} joined. Total in room: {len(rooms[room])}")
     await broadcast(room, {"type": "system", "text": f"{username} joined the room"})
 
-    # Send this client the room's history, decrypted + re-verified live.
-    for old_payload in build_history_payloads(conn, fernet, room):
+    history = await build_history_payloads(pool, fernet, room)
+    for old_payload in history:
         await ws.send_json(old_payload)
 
     try:
@@ -122,13 +124,6 @@ async def websocket_handler(request):
             if msg.type == WSMsgType.TEXT:
                 timestamp = datetime.now().strftime("%H:%M:%S")
 
-                # The client sends {"text": ..., "message_id": ..., "signature": ...}.
-                # message_id: see the dedup note above.
-                # signature: computed by the CLIENT over `text` with its
-                # own private key (see frontend/src/lib/identity.js) --
-                # the server never signs, only verifies. Plain-text
-                # frames or a missing signature (old clients, tools like
-                # tamper_demo) verify as False rather than crashing.
                 try:
                     parsed = json.loads(msg.data)
                     plaintext = parsed["text"]
@@ -139,21 +134,16 @@ async def websocket_handler(request):
                     message_id = str(uuid.uuid4())
                     signature = ""
 
-                public_key = get_verifier_public_key(conn, username)
+                public_key = await get_verifier_public_key(pool, username)
                 verified = crypto_utils.verify_signature(public_key, plaintext, signature)
 
                 ciphertext = crypto_utils.encrypt_text(fernet, plaintext)
-                message_id, inserted = database.save_message(
-                    conn, room, username, ciphertext, signature, verified, message_id
+                message_id, inserted = await database.run_async(
+                    database.save_message,
+                    pool, room, username, ciphertext, signature, verified, message_id,
                 )
 
                 if not inserted:
-                    # Duplicate: same message_id already stored (a retry
-                    # that actually landed the first time, e.g. the
-                    # connection dropped before the sender saw the ack).
-                    # Don't re-broadcast to the whole room -- everyone
-                    # else already got it -- but DO echo it back to just
-                    # this sender so their retry is confirmed/cleared.
                     print(f"[{room}] {username} ({timestamp}): duplicate message_id={message_id}, ignored")
                     await ws.send_json({
                         "type": "message", "user": username, "text": plaintext,
@@ -161,11 +151,15 @@ async def websocket_handler(request):
                     })
                     continue
 
+                # New (non-duplicate) message -- fan it out to peer
+                # backends so their local Valkey ends up with it too.
+                asyncio.create_task(replication.fanout({
+                    "message_id": message_id, "room": room, "sender": username,
+                    "ciphertext": ciphertext, "signature": signature, "verified": verified,
+                }))
+
                 print(f"[{room}] {username} ({timestamp}): signed & encrypted, verified={verified}")
 
-                # Live broadcast carries PLAINTEXT (these clients are
-                # already inside an authenticated live session) -- only
-                # what touches the DATABASE is encrypted.
                 await broadcast(room, {
                     "type": "message", "user": username, "text": plaintext,
                     "time": timestamp, "verified": verified, "message_id": message_id,

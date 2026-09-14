@@ -1,9 +1,11 @@
+import asyncio
 import pathlib
 from aiohttp import web
 from cryptography.fernet import Fernet
 
 import database
 import crypto_utils
+import replication
 from chat_handler import websocket_handler
 
 FRONTEND_DIR = pathlib.Path(__file__).resolve().parent.parent / "frontend"
@@ -32,10 +34,8 @@ async def submit_message(request):
 
     An optional "message-id" field can also be supplied by the caller --
     if the same message-id is sent twice (e.g. a retried request after a
-    dropped connection), the database's unique constraint on message_id
-    guarantees the second attempt is a safe no-op, not a duplicate row.
-    If omitted, the server generates a fresh one, so retries are only
-    dedup-safe when the caller supplies its own message-id.
+    dropped connection), the dedup in database.save_message guarantees
+    the second attempt is a safe no-op, not a duplicate entry.
     """
     data = {}
     if request.can_read_body:
@@ -56,16 +56,22 @@ async def submit_message(request):
             {"error": "both client-name and msg are required"}, status=400
         )
 
-    conn = request.app["db_conn"]
+    pool = request.app["db_conn"]
     fernet = request.app["fernet"]
 
     ciphertext = crypto_utils.encrypt_text(fernet, msg)
-    # No signature for REST-submitted messages -- there's no client-side
-    # signing key involved here, only the websocket chat clients do that.
-    message_id, inserted = database.save_message(
-        conn, REST_ROOM, client_name, ciphertext,
-        signature="", verified_at_insert=False, message_id=message_id,
+    message_id, inserted = await database.run_async(
+        database.save_message,
+        pool, REST_ROOM, client_name, ciphertext, "", False, message_id,
     )
+
+    if inserted:
+        # Fire-and-forget: replicate to peer backends so their LOCAL
+        # Valkey also has this message. Doesn't block this response.
+        asyncio.create_task(replication.fanout({
+            "message_id": message_id, "room": REST_ROOM, "sender": client_name,
+            "ciphertext": ciphertext, "signature": "", "verified": False,
+        }))
 
     return web.json_response({
         "message-id": message_id,
@@ -75,13 +81,29 @@ async def submit_message(request):
     })
 
 
-async def get_feed(request):
-    """GET /feed -- returns every stored message, oldest first, as JSON."""
-    conn = request.app["db_conn"]
-    fernet = request.app["fernet"]
+async def replicate_in(request):
+    """POST /replicate -- internal route. A peer backend calls this to
+    tell us to apply a message it already accepted, so our own local
+    Valkey stays in sync. This never fans out further (flat, one-hop
+    topology) -- the originating backend already told every peer
+    directly, so there's nothing more to forward."""
+    payload = await request.json()
+    pool = request.app["db_conn"]
+    await database.run_async(
+        database.save_message,
+        pool, payload["room"], payload["sender"], payload["ciphertext"],
+        payload.get("signature", ""), payload.get("verified", False),
+        payload["message_id"],
+    )
+    return web.json_response({"ok": True})
 
+
+def _build_feed_sync(pool, fernet):
+    """Runs entirely inside a worker thread: query + decrypt + build the
+    JSON-ready list, all in one blocking call."""
+    rows = database.load_all_messages(pool)
     feed = []
-    for message_id, sender, ciphertext, room_id, timestamp in database.load_all_messages(conn):
+    for message_id, sender, ciphertext, room_id, timestamp in rows:
         plaintext = crypto_utils.decrypt_text(fernet, ciphertext)
         feed.append({
             "message-id": message_id,
@@ -90,16 +112,26 @@ async def get_feed(request):
             "room": room_id,
             "timestamp": str(timestamp),
         })
+    return feed
 
+
+async def get_feed(request):
+    """GET /feed -- returns every stored message, oldest first, as JSON.
+    Reads entirely from THIS backend's local Valkey -- no network hop,
+    no shared bottleneck, since every backend holds the full dataset
+    via replication.py's fan-out."""
+    pool = request.app["db_conn"]
+    fernet = request.app["fernet"]
+    feed = await database.run_async(_build_feed_sync, pool, fernet)
     return web.json_response(feed)
 
 
 def create_app():
     app = web.Application()
 
-    conn = database.get_connection()
-    database.init_db(conn)
-    app["db_conn"] = conn
+    pool = database.get_pool()
+    database.init_db(pool)  # one-time, at startup -- fine to block briefly here
+    app["db_conn"] = pool
 
     encryption_key = crypto_utils.load_or_create_encryption_key()
     app["fernet"] = Fernet(encryption_key)
@@ -110,6 +142,7 @@ def create_app():
     app.router.add_get("/health", health)
     app.router.add_post("/message", submit_message)
     app.router.add_get("/feed", get_feed)
+    app.router.add_post("/replicate", replicate_in)
 
     return app
 

@@ -1,165 +1,134 @@
 """
 database.py
 ------------
-ONLY job: talk to PostgreSQL. Nothing in here knows about encryption or
-signatures -- it just stores and retrieves whatever strings it's given.
+Storage layer, now backed by Valkey (a Redis-protocol-compatible,
+in-memory store) instead of Postgres.
 
-This is the plain/basic Postgres version: one connection, no pooling,
-no replicas, no sharding. It exists to prove the migration works before
-adding any performance optimizations.
+WHY THIS CHANGED (previous version was pooled Postgres):
+Postgres, even pooled, is still one disk-backed engine and one network
+hop away from every backend. For a write-once/read-many workload like
+this chat app (messages are immutable once written; /feed and history
+loads are read far more often than /message writes), the real fix is
+giving every backend its own full LOCAL copy of the data, so reads
+never leave the machine. See replication.py for the other half of this
+(how each backend's writes reach its peers).
 
-WHY SEPARATE FILE:
-Everything else in the app (server.py, chat_handler.py) only calls the
-functions below -- it never talks to the database directly. That's why
-swapping SQLite for PostgreSQL only required editing this one file.
+CONNECTS TO A LOCAL VALKEY INSTANCE:
+Each backend machine should run its own `valkey-server` on localhost.
+There's no cross-machine DB traffic here at all -- only the small
+HTTP fan-out in replication.py crosses machines.
 
-CONNECTION:
-Set these via environment variables (all have local defaults so it
-runs out of the box against a local Postgres install):
-
-    DB_HOST      (default: localhost)
-    DB_PORT      (default: 5432)
-    DB_NAME      (default: chatdb)
-    DB_USER      (default: postgres)
-    DB_PASSWORD  (default: postgres)
+DATA MODEL:
+- "messages" is a single Redis STREAM (an append-only log) holding
+  every message from every room, in insertion order.
+- "seen_ids" is a SET used purely for O(1) atomic dedup: SADD returns
+  0 if the message_id was already present, which is what makes
+  duplicate inserts (from retries, or from replication.py re-applying
+  a fan-out) a safe no-op instead of a duplicate entry.
+- "signers" is a HASH of username -> public key PEM.
 """
 
 import os
+import time
 import uuid
-import psycopg2
-import psycopg2.extras
+import asyncio
+import redis
 
 DB_HOST = os.environ.get("DB_HOST", "localhost")
-DB_PORT = os.environ.get("DB_PORT", "5432")
-DB_NAME = os.environ.get("DB_NAME", "chatdb")
-DB_USER = os.environ.get("DB_USER", "postgres")
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "postgres")
+DB_PORT = int(os.environ.get("DB_PORT", "6379"))
 
 
-def get_connection():
-    """Opens a connection to the shared Postgres database."""
-    return psycopg2.connect(
+def get_pool():
+    """Creates the connection pool for this backend process. Call once
+    at startup and pass the returned pool into every function below."""
+    return redis.ConnectionPool(
         host=DB_HOST,
         port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
+        decode_responses=True,
+        max_connections=50,
     )
 
 
-def init_db(conn):
-    """Creates the two tables we need, if they don't already exist."""
-
-    cursor = conn.cursor()
-
-    # `ciphertext` -- NOT `message` -- because we never store plaintext.
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
-        id                  SERIAL PRIMARY KEY,
-        message_id          TEXT UNIQUE,
-        room_id             TEXT NOT NULL,
-        sender              TEXT NOT NULL,
-        ciphertext          TEXT NOT NULL,
-        signature           TEXT NOT NULL,
-        timestamp           TIMESTAMPTZ DEFAULT NOW(),
-        verified_at_insert  BOOLEAN NOT NULL
-    )
-    """)
-
-    # One row per username: their permanent PUBLIC key. Private keys are
-    # never written here -- see crypto_utils.py for why.
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS signers (
-        username        TEXT PRIMARY KEY,
-        public_key_pem  TEXT NOT NULL
-    )
-    """)
-
-    conn.commit()
-    cursor.close()
+def _client(pool):
+    # Cheap: just wraps the shared pool, doesn't open a new connection.
+    return redis.Redis(connection_pool=pool)
 
 
-def save_message(conn, room_id, sender, ciphertext, signature, verified_at_insert, message_id=None):
+async def run_async(func, *args):
+    """Runs a blocking function in a worker thread so it never blocks
+    the asyncio event loop. Usage:
+        await database.run_async(database.save_message, pool, ...)
+    Valkey/Redis calls are extremely fast (in-memory, sub-millisecond),
+    but we keep this pattern for consistency and safety under load.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, func, *args)
+
+
+def init_db(pool):
+    """No schema to create -- Redis/Valkey structures spring into
+    existence on first write. Just confirm we can actually reach it."""
+    _client(pool).ping()
+
+
+def save_message(pool, room_id, sender, ciphertext, signature, verified_at_insert, message_id=None):
     """Saves a message with deduplication by message_id.
     Returns (message_id, inserted).
 
-    ON CONFLICT DO NOTHING is what guarantees no duplicate rows even if
-    the same message_id is sent twice (retry, reconnect, etc.) -- the
-    database enforces this, not the application.
+    SADD is atomic and returns 0 if the id was already a member of the
+    set -- that's the entire dedup mechanism, no locks needed. This is
+    also what makes replication.py's fan-out safe to apply twice.
     """
     if not message_id:
         message_id = str(uuid.uuid4())
 
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO messages (message_id, room_id, sender, ciphertext, signature, verified_at_insert)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (message_id) DO NOTHING
-        """,
-        (message_id, room_id, sender, ciphertext, signature, verified_at_insert),
-    )
-    conn.commit()
-    inserted = cursor.rowcount > 0
-    cursor.close()
-    return message_id, inserted
+    r = _client(pool)
+    added = r.sadd("seen_ids", message_id)
+    if not added:
+        return message_id, False
+
+    r.xadd("messages", {
+        "message_id": message_id,
+        "room": room_id,
+        "sender": sender,
+        "ciphertext": ciphertext,
+        "signature": signature,
+        "verified": "1" if verified_at_insert else "0",
+        "ts": time.time(),
+    })
+    return message_id, True
 
 
-def load_room_messages(conn, room_id):
-    """Returns (message_id, sender, ciphertext, signature, timestamp) for every
-    message in a room, oldest first."""
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT COALESCE(message_id, CAST(id AS TEXT)), sender, ciphertext, signature, timestamp
-        FROM messages
-        WHERE room_id = %s
-        ORDER BY id
-        """,
-        (room_id,),
-    )
-    rows = cursor.fetchall()
-    cursor.close()
+def load_room_messages(pool, room_id):
+    """Returns (message_id, sender, ciphertext, signature, timestamp)
+    for every message in a room, oldest first."""
+    r = _client(pool)
+    rows = []
+    for _stream_id, fields in r.xrange("messages"):
+        if fields.get("room") == room_id:
+            rows.append((
+                fields["message_id"], fields["sender"], fields["ciphertext"],
+                fields["signature"], fields["ts"],
+            ))
     return rows
 
 
-def load_all_messages(conn):
+def load_all_messages(pool):
     """Returns (message_id, sender, ciphertext, room_id, timestamp) for
-    EVERY message across ALL rooms, oldest first. Used by the /feed
-    REST endpoint, which (unlike the websocket chat) isn't scoped to a
-    single room."""
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT COALESCE(message_id, CAST(id AS TEXT)), sender, ciphertext, room_id, timestamp
-        FROM messages
-        ORDER BY id
-        """
-    )
-    rows = cursor.fetchall()
-    cursor.close()
+    EVERY message across ALL rooms, oldest first. Used by /feed."""
+    r = _client(pool)
+    rows = []
+    for _stream_id, fields in r.xrange("messages"):
+        rows.append((
+            fields["message_id"], fields["sender"], fields["ciphertext"],
+            fields["room"], fields["ts"],
+        ))
     return rows
 
 
-def save_public_key(conn, username, public_key_pem):
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO signers (username, public_key_pem) VALUES (%s, %s)
-        ON CONFLICT (username) DO UPDATE SET public_key_pem = EXCLUDED.public_key_pem
-        """,
-        (username, public_key_pem),
-    )
-    conn.commit()
-    cursor.close()
+def save_public_key(pool, username, public_key_pem):
+    _client(pool).hset("signers", username, public_key_pem)
 
 
-def load_public_key(conn, username):
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT public_key_pem FROM signers WHERE username = %s",
-        (username,),
-    )
-    row = cursor.fetchone()
-    cursor.close()
-    return row[0] if row else None
+def load_public_key(pool, username):
+    return _client(pool).hget("signers", username)
