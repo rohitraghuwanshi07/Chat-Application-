@@ -126,6 +126,20 @@ async def get_feed(request):
     return web.json_response(feed)
 
 
+async def on_startup(app):
+    """Creates the single shared replication ClientSession for this
+    process's lifetime. Must happen before any fanout() call -- see
+    replication.py for why a shared session (vs. one per message)
+    matters under load."""
+    replication.init_session()
+
+
+async def on_cleanup(app):
+    """Closes the shared replication session's connections cleanly on
+    shutdown, so sockets aren't leaked."""
+    await replication.close_session()
+
+
 def create_app():
     app = web.Application()
 
@@ -143,6 +157,9 @@ def create_app():
     app.router.add_post("/message", submit_message)
     app.router.add_get("/feed", get_feed)
     app.router.add_post("/replicate", replicate_in)
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
 
     return app
 
