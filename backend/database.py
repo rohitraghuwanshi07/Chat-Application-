@@ -61,7 +61,7 @@ DB_PORT = int(os.environ.get("DB_PORT", "6379"))
 # balancer is configured with (default 500 in cmd/loadbalancer), so a
 # full burst of concurrent requests never queues up behind a
 # too-small pool. Override via env var if you tune the LB's flag.
-DB_WORKERS = int(os.environ.get("DB_WORKERS", "128"))
+DB_WORKERS = int(os.environ.get("DB_WORKERS", "64"))
 
 # A dedicated executor, NOT asyncio's default one. Every database.*
 # call below goes through this pool via run_async(), instead of
@@ -169,6 +169,20 @@ def load_all_messages(pool):
             fields["room"], fields["ts"],
         ))
     return rows
+
+
+def load_room_messages_with_signers(pool, room_id):
+    """Load a room's messages and all signer public keys in one Redis worker
+    operation, avoiding one HGET per historical message."""
+    r = _client(pool)
+    rows = []
+    for _stream_id, fields in r.xrange("messages"):
+        if fields.get("room") == room_id:
+            rows.append((
+                fields["message_id"], fields["sender"], fields["ciphertext"],
+                fields["signature"], fields["ts"],
+            ))
+    return rows, r.hgetall("signers")
 
 
 def save_public_key(pool, username, public_key_pem):

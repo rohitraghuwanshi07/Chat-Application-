@@ -50,18 +50,20 @@ async def get_verifier_public_key(pool, username):
 
 
 async def broadcast(room, payload, exclude=None):
-    """Sends `payload` to every client in `room`. If sending to a client
-    fails (their connection is dying), we don't let that crash delivery
-    to everyone else -- we just clean that client up afterwards."""
-    dead_clients = []
-    for client in list(rooms.get(room, {})):
-        if client is not exclude:
-            try:
-                await client.send_json(payload)
-            except Exception:
-                dead_clients.append(client)
-    for dead in dead_clients:
-        rooms.get(room, {}).pop(dead, None)
+    """Send to room members concurrently so one slow websocket cannot
+    serialize delivery to every other client."""
+    clients = [c for c in list(rooms.get(room, {})) if c is not exclude]
+    if not clients:
+        return
+
+    results = await asyncio.gather(
+        *(client.send_json(payload) for client in clients),
+        return_exceptions=True,
+    )
+    room_clients = rooms.get(room, {})
+    for client, result in zip(clients, results):
+        if isinstance(result, Exception):
+            room_clients.pop(client, None)
 
 
 async def build_history_payloads(pool, fernet: Fernet, room_id):
@@ -72,7 +74,7 @@ async def build_history_payloads(pool, fernet: Fernet, room_id):
     up even after a server restart: if a row was edited directly in the
     database, this re-check will now disagree with the original result.
     """
-    rows = await database.run_async(database.load_room_messages, pool, room_id)
+    rows, signers = await database.run_async(database.load_room_messages_with_signers, pool, room_id)
     payloads = []
 
     for message_id, sender, ciphertext, signature, timestamp in rows:
@@ -86,7 +88,8 @@ async def build_history_payloads(pool, fernet: Fernet, room_id):
             })
             continue
 
-        public_key = await get_verifier_public_key(pool, sender)
+        pem = signers.get(sender)
+        public_key = crypto_utils.pem_to_public_key(pem) if pem else None
         verified_now = crypto_utils.verify_signature(public_key, plaintext, signature)
         payloads.append({
             "type": "message", "user": sender, "text": plaintext,
@@ -112,6 +115,9 @@ async def websocket_handler(request):
     if pubkey_pem:
         await database.run_async(database.save_public_key, pool, username, pubkey_pem)
 
+    verifier_pem = pubkey_pem or await database.run_async(database.load_public_key, pool, username)
+    verifier_public_key = crypto_utils.pem_to_public_key(verifier_pem) if verifier_pem else None
+
     print(f"[{room}] {username} joined. Total in room: {len(rooms[room])}")
     await broadcast(room, {"type": "system", "text": f"{username} joined the room"})
 
@@ -134,8 +140,7 @@ async def websocket_handler(request):
                     message_id = str(uuid.uuid4())
                     signature = ""
 
-                public_key = await get_verifier_public_key(pool, username)
-                verified = crypto_utils.verify_signature(public_key, plaintext, signature)
+                verified = crypto_utils.verify_signature(verifier_public_key, plaintext, signature)
 
                 ciphertext = crypto_utils.encrypt_text(fernet, plaintext)
                 message_id, inserted = await database.run_async(
@@ -144,7 +149,6 @@ async def websocket_handler(request):
                 )
 
                 if not inserted:
-                    print(f"[{room}] {username} ({timestamp}): duplicate message_id={message_id}, ignored")
                     await ws.send_json({
                         "type": "message", "user": username, "text": plaintext,
                         "time": timestamp, "verified": verified, "message_id": message_id,
@@ -158,7 +162,6 @@ async def websocket_handler(request):
                     "ciphertext": ciphertext, "signature": signature, "verified": verified,
                 }))
 
-                print(f"[{room}] {username} ({timestamp}): signed & encrypted, verified={verified}")
 
                 await broadcast(room, {
                     "type": "message", "user": username, "text": plaintext,

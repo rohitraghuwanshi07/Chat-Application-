@@ -1,4 +1,5 @@
 import asyncio
+import os
 import pathlib
 from aiohttp import web
 from cryptography.fernet import Fernet
@@ -7,6 +8,36 @@ import database
 import crypto_utils
 import replication
 from chat_handler import websocket_handler
+
+
+
+@web.middleware
+async def admission_middleware(request, handler):
+    # WebSockets are long-lived connections, so they need a separate
+    # message-level policy rather than consuming one HTTP slot forever.
+    if request.path in ("/ws", "/health"):
+        return await handler(request)
+
+    app = request.app
+    max_inflight = app["max_inflight"]
+    active = app["active_requests"]
+
+    # aiohttp runs application code on one event loop thread, and there is
+    # no await between this check and increment, so admission is atomic for
+    # this process. Requests beyond the cap are rejected immediately rather
+    # than waiting in an unbounded application-side queue.
+    if active >= max_inflight:
+        return web.json_response(
+            {"error": "backend busy, retry shortly"},
+            status=503,
+            headers={"Retry-After": "1"},
+        )
+
+    app["active_requests"] = active + 1
+    try:
+        return await handler(request)
+    finally:
+        app["active_requests"] -= 1
 
 FRONTEND_DIR = pathlib.Path(__file__).resolve().parent.parent / "frontend"
 
@@ -141,7 +172,9 @@ async def on_cleanup(app):
 
 
 def create_app():
-    app = web.Application()
+    app = web.Application(middlewares=[admission_middleware])
+    app["max_inflight"] = int(os.environ.get("MAX_INFLIGHT", "100"))
+    app["active_requests"] = 0
 
     pool = database.get_pool()
     database.init_db(pool)  # one-time, at startup -- fine to block briefly here
