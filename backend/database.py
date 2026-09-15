@@ -5,8 +5,8 @@ Async PostgreSQL client using asyncpg and a local connection pool.
 
 Each backend node has its own local PostgreSQL database.
 
-The application layer is responsible for replicating messages between
-backend nodes.
+The application layer is responsible for replicating messages
+between backend nodes.
 """
 
 import os
@@ -18,29 +18,81 @@ from cryptography.fernet import Fernet
 
 load_dotenv()
 
-DB_HOST = os.environ.get("CHAT_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.environ.get("CHAT_DB_PORT", "5432"))
-DB_NAME = os.environ.get("CHAT_DB_NAME", "chatdb")
-DB_USER = os.environ.get("CHAT_DB_USER", "chatuser")
-DB_PASS = os.environ.get("CHAT_DB_PASS")
 
+# ============================================================
+# DATABASE CONFIGURATION
+# ============================================================
+
+DB_HOST = os.environ.get(
+    "CHAT_DB_HOST",
+    "127.0.0.1",
+)
+
+DB_PORT = int(
+    os.environ.get(
+        "CHAT_DB_PORT",
+        "5432",
+    )
+)
+
+DB_NAME = os.environ.get(
+    "CHAT_DB_NAME",
+    "chatdb",
+)
+
+DB_USER = os.environ.get(
+    "CHAT_DB_USER",
+    "chatuser",
+)
+
+DB_PASS = os.environ.get(
+    "CHAT_DB_PASS"
+)
+
+
+# ============================================================
+# CONNECTION POOL
+# ============================================================
 
 async def get_connection():
-    """Create and return the PostgreSQL connection pool."""
+    """
+    Create and return the PostgreSQL connection pool.
+
+    Each backend has its own local PostgreSQL instance.
+    """
+
     return await asyncpg.create_pool(
         host=DB_HOST,
         port=DB_PORT,
         database=DB_NAME,
         user=DB_USER,
         password=DB_PASS,
+
+        # Small minimum pool avoids unnecessary idle
+        # PostgreSQL connections.
         min_size=2,
+
+        # Allows concurrent HTTP requests and replication
+        # operations to use separate DB connections.
         max_size=10,
     )
 
 
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
 async def init_db(pool):
-    """Create all application tables and indexes if they do not exist."""
+    """
+    Create application tables and indexes if they do not exist.
+    """
+
     async with pool.acquire() as conn:
+
+        # ----------------------------------------------------
+        # Messages
+        # ----------------------------------------------------
+
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -51,18 +103,26 @@ async def init_db(pool):
                 ciphertext          TEXT NOT NULL,
                 message_text        TEXT,
                 signature            TEXT NOT NULL,
-                timestamp            TIMESTAMP DEFAULT now(),
+                timestamp           TIMESTAMP DEFAULT now(),
                 verified_at_insert  BOOLEAN NOT NULL
             )
             """
         )
 
+        # ----------------------------------------------------
+        # Migration for existing installations
+        # ----------------------------------------------------
+
         await conn.execute(
-           """
-           ALTER TABLE messages
-           ADD COLUMN IF NOT EXISTS message_text TEXT
-           """
+            """
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS message_text TEXT
+            """
         )
+
+        # ----------------------------------------------------
+        # Signers
+        # ----------------------------------------------------
 
         await conn.execute(
             """
@@ -74,6 +134,10 @@ async def init_db(pool):
             """
         )
 
+        # ----------------------------------------------------
+        # Server secret
+        # ----------------------------------------------------
+
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS server_secret (
@@ -82,6 +146,10 @@ async def init_db(pool):
             )
             """
         )
+
+        # ----------------------------------------------------
+        # Indexes
+        # ----------------------------------------------------
 
         await conn.execute(
             """
@@ -99,11 +167,16 @@ async def init_db(pool):
 
         await conn.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_messages_room_timestamp
+            CREATE INDEX IF NOT EXISTS
+            idx_messages_room_timestamp
             ON messages(room_id, timestamp DESC)
             """
         )
 
+
+# ============================================================
+# SAVE MESSAGE
+# ============================================================
 
 async def save_message(
     pool,
@@ -118,10 +191,20 @@ async def save_message(
     """
     Idempotently insert a message.
 
-    Returns True if this call inserted the message and False if the
-    message already existed.
+    Returns:
+
+        True
+            if this call inserted the message.
+
+        False
+            if msg_id already existed.
+
+    This is important for replication because the same message
+    may arrive more than once.
     """
+
     async with pool.acquire() as conn:
+
         result = await conn.execute(
             """
             INSERT INTO messages (
@@ -133,8 +216,17 @@ async def save_message(
                 signature,
                 verified_at_insert
             )
-            VALUES ($1, $2, $3, $4, $5, $6,$7)
-            ON CONFLICT (msg_id) DO NOTHING
+            VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7
+            )
+            ON CONFLICT (msg_id)
+            DO NOTHING
             """,
             msg_id,
             room_id,
@@ -148,11 +240,29 @@ async def save_message(
     return result == "INSERT 0 1"
 
 
-async def load_room_messages(pool, room_id, limit=1000):
-    """Load the newest messages for one room."""
-    limit = max(1, min(int(limit), 5000))
+# ============================================================
+# LOAD ROOM MESSAGES
+# ============================================================
+
+async def load_room_messages(
+    pool,
+    room_id,
+    limit=1000,
+):
+    """
+    Load the newest messages for one room.
+    """
+
+    limit = max(
+        1,
+        min(
+            int(limit),
+            5000,
+        ),
+    )
 
     async with pool.acquire() as conn:
+
         rows = await conn.fetch(
             """
             SELECT
@@ -171,25 +281,40 @@ async def load_room_messages(pool, room_id, limit=1000):
 
         return [
             (
-                r["sender"],
-                r["ciphertext"],
-                r["signature"],
-                r["timestamp"],
+                row["sender"],
+                row["ciphertext"],
+                row["signature"],
+                row["timestamp"],
             )
-            for r in rows
+            for row in rows
         ]
 
 
-async def load_recent_messages(pool, limit=1000):
+# ============================================================
+# LOAD RECENT MESSAGES
+# ============================================================
+
+async def load_recent_messages(
+    pool,
+    limit=1000,
+):
     """
     Load the newest messages from the local database.
 
-    The limit prevents /feed from materializing an unbounded number of
-    rows in backend memory.
+    The limit prevents /feed from materializing an unbounded
+    number of rows in backend memory.
     """
-    limit = max(1, min(int(limit), 100000))
+
+    limit = max(
+        1,
+        min(
+            int(limit),
+            100000,
+        ),
+    )
 
     async with pool.acquire() as conn:
+
         rows = await conn.fetch(
             """
             SELECT
@@ -209,26 +334,31 @@ async def load_recent_messages(pool, limit=1000):
 
         return [
             (
-                r["msg_id"],
-                r["room_id"],
-                r["sender"],
-                r["message_text"],
-                r["ciphertext"],
-                r["signature"],
-                r["timestamp"],
+                row["msg_id"],
+                row["room_id"],
+                row["sender"],
+                row["message_text"],
+                row["ciphertext"],
+                row["signature"],
+                row["timestamp"],
             )
-            for r in rows
+            for row in rows
         ]
 
+
+# ============================================================
+# LOAD ALL MESSAGES
+# ============================================================
 
 async def load_all_messages(pool):
     """
     Compatibility helper.
 
-    New code should prefer load_recent_messages() so that /feed does
-    not create an unbounded memory allocation.
+    New code should prefer load_recent_messages().
     """
+
     async with pool.acquire() as conn:
+
         rows = await conn.fetch(
             """
             SELECT
@@ -246,20 +376,34 @@ async def load_all_messages(pool):
 
         return [
             (
-                r["msg_id"],
-                r["room_id"],
-                r["sender"],
-                r["message_text"],
-                r["ciphertext"],
-                r["signature"],
-                r["timestamp"],
+                row["msg_id"],
+                row["room_id"],
+                row["sender"],
+                row["message_text"],
+                row["ciphertext"],
+                row["signature"],
+                row["timestamp"],
             )
-            for r in rows
+            for row in rows
         ]
 
 
-async def save_signing_key(pool, username, public_key_pem, private_key_pem):
+# ============================================================
+# SIGNING KEYS
+# ============================================================
+
+async def save_signing_key(
+    pool,
+    username,
+    public_key_pem,
+    private_key_pem,
+):
+    """
+    Save a user's signing keys if they do not already exist.
+    """
+
     async with pool.acquire() as conn:
+
         await conn.execute(
             """
             INSERT INTO signers (
@@ -267,8 +411,13 @@ async def save_signing_key(pool, username, public_key_pem, private_key_pem):
                 public_key_pem,
                 private_key_pem
             )
-            VALUES ($1, $2, $3)
-            ON CONFLICT (username) DO NOTHING
+            VALUES (
+                $1,
+                $2,
+                $3
+            )
+            ON CONFLICT (username)
+            DO NOTHING
             """,
             username,
             public_key_pem,
@@ -276,35 +425,59 @@ async def save_signing_key(pool, username, public_key_pem, private_key_pem):
         )
 
 
-async def load_signing_key(pool, username):
-    """Return (public_key_pem, private_key_pem) or None."""
+async def load_signing_key(
+    pool,
+    username,
+):
+    """
+    Return:
+
+        (public_key_pem, private_key_pem)
+
+    or:
+
+        None
+    """
+
     async with pool.acquire() as conn:
+
         row = await conn.fetchrow(
             """
-            SELECT public_key_pem, private_key_pem
+            SELECT
+                public_key_pem,
+                private_key_pem
             FROM signers
             WHERE username = $1
             """,
             username,
         )
 
+        if not row:
+            return None
+
         return (
-            (row["public_key_pem"], row["private_key_pem"])
-            if row
-            else None
+            row["public_key_pem"],
+            row["private_key_pem"],
         )
 
 
+# ============================================================
+# FERNET KEY
+# ============================================================
+
 async def get_or_create_fernet_key(pool):
     """
-    Get or create the Fernet key stored in this backend's database.
+    Get or create the Fernet key stored in this backend's
+    local database.
 
-    NOTE:
-    With per-node databases, this creates one key per node. The current
-    /feed implementation returns the stored ciphertext directly, so
-    replication does not require cross-node Fernet decryption.
+    Each backend therefore owns its own local Fernet key.
+
+    /feed uses message_text directly, so cross-node replication
+    does not require decrypting another node's ciphertext.
     """
+
     async with pool.acquire() as conn:
+
         row = await conn.fetchrow(
             """
             SELECT fernet_key
@@ -314,18 +487,34 @@ async def get_or_create_fernet_key(pool):
         )
 
         if row:
+
             return row["fernet_key"].encode()
+
+        # ----------------------------------------------------
+        # Generate new key
+        # ----------------------------------------------------
 
         key = Fernet.generate_key()
 
         await conn.execute(
             """
-            INSERT INTO server_secret (id, fernet_key)
-            VALUES (1, $1)
-            ON CONFLICT (id) DO NOTHING
+            INSERT INTO server_secret (
+                id,
+                fernet_key
+            )
+            VALUES (
+                1,
+                $1
+            )
+            ON CONFLICT (id)
+            DO NOTHING
             """,
             key.decode(),
         )
+
+        # ----------------------------------------------------
+        # Read actual stored key
+        # ----------------------------------------------------
 
         row = await conn.fetchrow(
             """
