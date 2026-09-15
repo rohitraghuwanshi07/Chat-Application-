@@ -13,11 +13,14 @@ Public API:
 Internal API:
     POST /internal/replicate
 
-Each backend owns a local PostgreSQL database. Messages are synchronously
-replicated to the other backend nodes before the original /message request
-returns success.
+Each backend owns a local PostgreSQL database.
+
+Messages are persisted locally first. Replication to the other backend
+nodes happens asynchronously in the background so slow replication peers
+do not block the public /message request.
 """
 
+import asyncio
 import os
 import pathlib
 import time
@@ -68,6 +71,9 @@ FRONTEND_DIR = (
 
 active_requests = 0
 
+# Background replication queue.
+replication_queue = None
+
 
 async def index(request):
     return web.FileResponse(
@@ -113,13 +119,15 @@ async def replicate_to_peer(peer, payload):
             return response_body
 
 
-async def replicate_message(request, payload):
+async def replicate_message(payload):
     """
     Replicate one message to every configured peer.
 
-    All configured peers must acknowledge the message. If any peer fails,
-    this function raises an exception and the original /message request
-    fails instead of falsely reporting successful cluster replication.
+    All configured peers must acknowledge the message for this
+    replication attempt to be considered successful.
+
+    This function runs in the background and does not block the
+    public /message request.
     """
     if not REPLICATION_PEERS:
         raise RuntimeError(
@@ -131,14 +139,17 @@ async def replicate_message(request, payload):
         for peer in REPLICATION_PEERS
     ]
 
-    results = await __import__("asyncio").gather(
+    results = await asyncio.gather(
         *tasks,
         return_exceptions=True,
     )
 
     failures = []
 
-    for peer, result in zip(REPLICATION_PEERS, results):
+    for peer, result in zip(
+        REPLICATION_PEERS,
+        results,
+    ):
         if isinstance(result, Exception):
             failures.append(
                 f"{peer}: {result}"
@@ -148,6 +159,51 @@ async def replicate_message(request, payload):
         raise RuntimeError(
             "replication failed: " + "; ".join(failures)
         )
+
+
+async def replication_worker():
+    """
+    Background worker that processes queued replication jobs.
+
+    The local database insert is the persistence point for /message.
+
+    Replication to peer backends happens asynchronously so slow peers
+    do not block the public request.
+
+    Each message gets up to three replication attempts.
+    """
+    while True:
+        payload = await replication_queue.get()
+
+        try:
+            for attempt in range(3):
+                try:
+                    await replicate_message(payload)
+
+                    print(
+                        f"[REPLICATION-OK] "
+                        f"backend={BACKEND_ID} "
+                        f"msg_id={payload.get('msg_id')} "
+                        f"attempt={attempt + 1}"
+                    )
+
+                    break
+
+                except Exception as exc:
+                    if attempt == 2:
+                        print(
+                            f"[REPLICATION-BACKGROUND-ERROR] "
+                            f"backend={BACKEND_ID} "
+                            f"msg_id={payload.get('msg_id')} "
+                            f"error={exc}"
+                        )
+                    else:
+                        await asyncio.sleep(
+                            0.5 * (attempt + 1)
+                        )
+
+        finally:
+            replication_queue.task_done()
 
 
 async def http_message(request):
@@ -175,7 +231,9 @@ async def http_message(request):
             body = await request.json()
         except Exception:
             return web.json_response(
-                {"error": "request body must be valid JSON"},
+                {
+                    "error": "request body must be valid JSON"
+                },
                 status=400,
             )
 
@@ -194,6 +252,9 @@ async def http_message(request):
         if not isinstance(room, str) or not room:
             room = "general"
 
+        # Generate the message ID exactly once.
+        #
+        # The same ID is stored locally and sent to every replica.
         msg_id = body.get("msg_id") or str(uuid.uuid4())
 
         # ---------------------------------------------------------
@@ -259,7 +320,7 @@ async def http_message(request):
         db_save_time = time.perf_counter() - t
 
         # ---------------------------------------------------------
-        # 5. Replicate to every other backend
+        # 5. Queue replication in the background
         # ---------------------------------------------------------
         replication_payload = {
             "msg_id": msg_id,
@@ -273,29 +334,9 @@ async def http_message(request):
 
         t = time.perf_counter()
 
-        try:
-            await replicate_message(
-                request,
-                replication_payload,
-            )
-        except Exception as exc:
-            replication_time = time.perf_counter() - t
-
-            print(
-                f"[REPLICATION-ERROR] "
-                f"backend={BACKEND_ID} "
-                f"msg_id={msg_id} "
-                f"time={replication_time:.4f}s "
-                f"error={exc}"
-            )
-
-            return web.json_response(
-                {
-                    "error": "message replication failed",
-                    "msg_id": msg_id,
-                },
-                status=503,
-            )
+        replication_queue.put_nowait(
+            replication_payload
+        )
 
         replication_time = time.perf_counter() - t
 
@@ -324,7 +365,7 @@ async def http_message(request):
             f"crypto={crypto_time:.4f}s "
             f"encrypt={encryption_time:.4f}s "
             f"save={db_save_time:.4f}s "
-            f"replication={replication_time:.4f}s "
+            f"queue={replication_time:.6f}s "
             f"total={total_time:.4f}s"
         )
 
@@ -356,7 +397,9 @@ async def http_replicate(request):
 
     if not expected_secret:
         return web.json_response(
-            {"error": "replication is not configured"},
+            {
+                "error": "replication is not configured"
+            },
             status=503,
         )
 
@@ -367,7 +410,9 @@ async def http_replicate(request):
 
     if supplied_secret != expected_secret:
         return web.json_response(
-            {"error": "unauthorized"},
+            {
+                "error": "unauthorized"
+            },
             status=401,
         )
 
@@ -375,7 +420,9 @@ async def http_replicate(request):
         body = await request.json()
     except Exception:
         return web.json_response(
-            {"error": "invalid JSON"},
+            {
+                "error": "invalid JSON"
+            },
             status=400,
         )
 
@@ -418,6 +465,7 @@ async def http_replicate(request):
     )
 
     # Only broadcast if this was actually a new local message.
+    #
     # Duplicate replication should not cause duplicate WebSocket events.
     if inserted:
         await broadcast(
@@ -425,7 +473,6 @@ async def http_replicate(request):
             {
                 "type": "message",
                 "user": body["client-name"],
-                 # Broadcast the original plaintext to local WebSocket clients.
                 "text": body["message_text"],
                 "verified": bool(body["verified"]),
             },
@@ -464,7 +511,10 @@ async def http_feed(request):
     except ValueError:
         limit = FEED_DEFAULT_LIMIT
 
-    limit = max(1, min(limit, 100000))
+    limit = max(
+        1,
+        min(limit, 100000),
+    )
 
     rows = await database.load_recent_messages(
         conn,
@@ -483,6 +533,7 @@ async def http_feed(request):
         signature,
         ts,
     ) in reversed(rows):
+
         out.append(
             {
                 "msg_id": msg_id,
@@ -497,7 +548,9 @@ async def http_feed(request):
 
 
 async def health(request):
-    """Polled by the load balancer."""
+    """
+    Polled by the load balancer.
+    """
     return web.json_response(
         {
             "cpu": psutil.cpu_percent(interval=None),
@@ -510,6 +563,11 @@ async def health(request):
 
 
 async def on_startup(app):
+    """
+    Initialize the local database and background replication worker.
+    """
+    global replication_queue
+
     pool = await database.get_connection()
 
     await database.init_db(pool)
@@ -522,8 +580,30 @@ async def on_startup(app):
 
     app["fernet"] = Fernet(fernet_key)
 
+    # Initialize the replication queue.
+    replication_queue = asyncio.Queue()
+
+    # Start exactly one replication worker per backend process.
+    app["replication_worker"] = asyncio.create_task(
+        replication_worker()
+    )
+
 
 async def on_cleanup(app):
+    """
+    Stop the background replication worker and then close the
+    database connection pool.
+    """
+    worker = app.get("replication_worker")
+
+    if worker:
+        worker.cancel()
+
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
     await app["db_conn"].close()
 
 
@@ -534,11 +614,30 @@ def create_app():
     app.on_cleanup.append(on_cleanup)
 
     # Public API
-    app.router.add_get("/", index)
-    app.router.add_get("/ws", websocket_handler)
-    app.router.add_post("/message", http_message)
-    app.router.add_get("/feed", http_feed)
-    app.router.add_get("/health", health)
+    app.router.add_get(
+        "/",
+        index,
+    )
+
+    app.router.add_get(
+        "/ws",
+        websocket_handler,
+    )
+
+    app.router.add_post(
+        "/message",
+        http_message,
+    )
+
+    app.router.add_get(
+        "/feed",
+        http_feed,
+    )
+
+    app.router.add_get(
+        "/health",
+        health,
+    )
 
     # Internal replication API
     app.router.add_post(
