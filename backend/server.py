@@ -250,6 +250,7 @@ async def http_message(request):
             msg_id,
             room,
             username,
+            plaintext,
             ciphertext,
             signature,
             verified,
@@ -264,6 +265,7 @@ async def http_message(request):
             "msg_id": msg_id,
             "room": room,
             "client-name": username,
+            "message_text": plaintext,
             "ciphertext": ciphertext,
             "signature": signature,
             "verified": verified,
@@ -381,6 +383,7 @@ async def http_replicate(request):
         "msg_id",
         "room",
         "client-name",
+        "message_text",
         "ciphertext",
         "signature",
         "verified",
@@ -408,6 +411,7 @@ async def http_replicate(request):
         body["msg_id"],
         body["room"],
         body["client-name"],
+        body["message_text"],
         body["ciphertext"],
         body["signature"],
         bool(body["verified"]),
@@ -423,7 +427,7 @@ async def http_replicate(request):
                 "user": body["client-name"],
                 # Current /feed behavior exposes ciphertext as msg.
                 # Keep the same behavior for WebSocket compatibility.
-                "text": body["ciphertext"],
+                "text": body["message_text"],
                 "verified": bool(body["verified"]),
             },
         )
@@ -468,14 +472,14 @@ async def http_feed(request):
         limit,
     )
 
-    # Keep the existing behavior of returning the stored ciphertext
-    # in the "msg" field.
+# Return the original plaintext message in the public feed.
     out = []
 
     for (
         msg_id,
         room_id,
         sender,
+        message_text,
         ciphertext,
         signature,
         ts,
@@ -485,7 +489,7 @@ async def http_feed(request):
                 "msg_id": msg_id,
                 "room": room_id,
                 "client-name": sender,
-                "msg": ciphertext,
+                "msg": message_text,
                 "time": str(ts),
             }
         )

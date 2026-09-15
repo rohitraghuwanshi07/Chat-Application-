@@ -49,11 +49,19 @@ async def init_db(pool):
                 room_id             TEXT NOT NULL,
                 sender              TEXT NOT NULL,
                 ciphertext          TEXT NOT NULL,
+                message_text        TEXT,
                 signature            TEXT NOT NULL,
                 timestamp            TIMESTAMP DEFAULT now(),
                 verified_at_insert  BOOLEAN NOT NULL
             )
             """
+        )
+
+        await conn.execute(
+           """
+           ALTER TABLE messages
+           ADD COLUMN IF NOT EXISTS message_text TEXT
+           """
         )
 
         await conn.execute(
@@ -102,6 +110,7 @@ async def save_message(
     msg_id,
     room_id,
     sender,
+    message_text,
     ciphertext,
     signature,
     verified_at_insert,
@@ -119,16 +128,18 @@ async def save_message(
                 msg_id,
                 room_id,
                 sender,
+                message_text,
                 ciphertext,
                 signature,
                 verified_at_insert
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6,$7)
             ON CONFLICT (msg_id) DO NOTHING
             """,
             msg_id,
             room_id,
             sender,
+            message_text,
             ciphertext,
             signature,
             verified_at_insert,
@@ -185,6 +196,7 @@ async def load_recent_messages(pool, limit=1000):
                 msg_id,
                 room_id,
                 sender,
+                message_text,
                 ciphertext,
                 signature,
                 timestamp
@@ -200,6 +212,7 @@ async def load_recent_messages(pool, limit=1000):
                 r["msg_id"],
                 r["room_id"],
                 r["sender"],
+                r["message_text"],
                 r["ciphertext"],
                 r["signature"],
                 r["timestamp"],
@@ -222,6 +235,7 @@ async def load_all_messages(pool):
                 msg_id,
                 room_id,
                 sender,
+                message_text,
                 ciphertext,
                 signature,
                 timestamp
@@ -235,6 +249,7 @@ async def load_all_messages(pool):
                 r["msg_id"],
                 r["room_id"],
                 r["sender"],
+                r["message_text"],
                 r["ciphertext"],
                 r["signature"],
                 r["timestamp"],
