@@ -13,24 +13,15 @@ Public API:
 Internal API:
     POST /internal/replicate
 
-Each backend owns a local PostgreSQL database.
-
-Message handling:
-    1. Validate request
-    2. Generate msg_id
-    3. Sign message
-    4. Verify signature
-    5. Encrypt message
-    6. Save message to LOCAL PostgreSQL
-    7. Queue replication in background
-    8. Broadcast locally
-    9. Return success
-
-Replication is asynchronous so slow peer databases do not block
-the public /message request.
-
-Multiple replication workers are used so that the replication queue
-can drain fast enough during load tests.
+Architecture:
+    - Each backend owns a local PostgreSQL database.
+    - /message persists locally first.
+    - Replication happens asynchronously.
+    - Multiple replication workers drain the replication queue.
+    - A persistent aiohttp session is reused for peer replication.
+    - Replication is idempotent through msg_id.
+    - /feed returns plaintext message text directly for the Lab 6
+      evaluator.
 """
 
 import asyncio
@@ -51,6 +42,7 @@ import crypto_utils
 from chat_handler import (
     websocket_handler,
     get_or_create_signing_key,
+    get_verifier_public_key,
     broadcast,
 )
 
@@ -70,7 +62,7 @@ HOST = os.environ.get(
 PORT = int(
     os.environ.get(
         "PORT",
-        "3000",
+        "4000",
     )
 )
 
@@ -105,13 +97,6 @@ REPLICATION_TIMEOUT_SECONDS = float(
     )
 )
 
-# Number of background replication workers.
-#
-# The old implementation used one worker.
-# That worker processed messages strictly one-by-one,
-# causing the replication queue to grow during load tests.
-#
-# Start with 8. This can later be tuned if necessary.
 REPLICATION_WORKERS = int(
     os.environ.get(
         "REPLICATION_WORKERS",
@@ -156,7 +141,7 @@ replication_session = None
 
 
 # ============================================================
-# PUBLIC ROUTES
+# PUBLIC INDEX
 # ============================================================
 
 async def index(request):
@@ -175,9 +160,7 @@ async def index(request):
 
 def replication_headers():
     """
-    Headers used by internal replication requests.
-
-    The secret allows backend nodes to authenticate each other.
+    Headers used for backend-to-backend replication.
     """
 
     return {
@@ -186,17 +169,19 @@ def replication_headers():
     }
 
 
-async def replicate_to_peer(peer, payload):
+async def replicate_to_peer(
+    peer,
+    payload,
+):
     """
-    Send one message to one backend peer.
+    Send one message to one peer.
 
-    A persistent aiohttp session is reused instead of creating a new
-    TCP session for every message.
+    Uses the shared persistent aiohttp session.
 
-    Raises an exception when:
-        - connection fails
-        - timeout occurs
-        - peer returns a non-200 status
+    Raises an exception if the peer:
+        - cannot be reached,
+        - times out,
+        - or returns a non-200 status.
     """
 
     global replication_session
@@ -206,31 +191,26 @@ async def replicate_to_peer(peer, payload):
             "replication HTTP session is not initialized"
         )
 
-    url = f"{peer}/internal/replicate"
+    url = (
+        f"{peer}/internal/replicate"
+    )
 
-    try:
-        async with replication_session.post(
-            url,
-            json=payload,
-            headers=replication_headers(),
-        ) as response:
+    async with replication_session.post(
+        url,
+        json=payload,
+        headers=replication_headers(),
+    ) as response:
 
-            response_body = await response.text()
+        response_body = await response.text()
 
-            if response.status != 200:
-                raise RuntimeError(
-                    f"peer={peer} "
-                    f"status={response.status} "
-                    f"body={response_body[:300]}"
-                )
+        if response.status != 200:
+            raise RuntimeError(
+                f"peer={peer} "
+                f"status={response.status} "
+                f"body={response_body[:300]}"
+            )
 
-            return response_body
-
-    except asyncio.CancelledError:
-        raise
-
-    except Exception:
-        raise
+        return response_body
 
 
 async def replicate_message(payload):
@@ -239,11 +219,11 @@ async def replicate_message(payload):
 
     All peers are contacted concurrently.
 
-    The operation succeeds only when every configured peer
-    acknowledges the replication.
+    The operation is considered successful only when all
+    configured peers acknowledge it.
 
-    Replication is idempotent because every peer receives the
-    same msg_id and the database uses:
+    The same msg_id is sent to every peer, so duplicate
+    deliveries are harmless because save_message() uses:
 
         ON CONFLICT (msg_id) DO NOTHING
     """
@@ -272,8 +252,10 @@ async def replicate_message(payload):
         REPLICATION_PEERS,
         results,
     ):
-
-        if isinstance(result, Exception):
+        if isinstance(
+            result,
+            Exception,
+        ):
             failures.append(
                 f"{peer}: {result}"
             )
@@ -286,23 +268,19 @@ async def replicate_message(payload):
 
 
 # ============================================================
-# BACKGROUND REPLICATION WORKER
+# REPLICATION WORKER
 # ============================================================
 
-async def replication_worker(worker_id):
+async def replication_worker(
+    worker_id,
+):
     """
-    Background worker responsible for draining the replication queue.
+    Drain the replication queue.
 
-    Multiple workers operate independently.
+    Multiple workers operate concurrently.
 
-    Example:
-
-        worker 1 -> message A
-        worker 2 -> message B
-        worker 3 -> message C
-        ...
-
-    Each individual message still sends to all peers concurrently.
+    Each worker takes one message at a time and retries failed
+    replication up to three times.
     """
 
     while True:
@@ -316,7 +294,7 @@ async def replication_worker(worker_id):
                 "unknown",
             )
 
-            succeeded = False
+            replicated = False
 
             for attempt in range(3):
 
@@ -326,7 +304,7 @@ async def replication_worker(worker_id):
                         payload
                     )
 
-                    succeeded = True
+                    replicated = True
 
                     break
 
@@ -337,11 +315,6 @@ async def replication_worker(worker_id):
 
                     if attempt < 2:
 
-                        # Increasing retry delay:
-                        #
-                        # attempt 0 -> 0.5 sec
-                        # attempt 1 -> 1.0 sec
-                        #
                         await asyncio.sleep(
                             0.5 * (attempt + 1)
                         )
@@ -356,7 +329,7 @@ async def replication_worker(worker_id):
                             f"error={exc}"
                         )
 
-            if succeeded:
+            if not replicated:
                 pass
 
         finally:
@@ -381,10 +354,12 @@ async def http_message(request):
         "msg_id": "optional UUID"
     }
 
-    The evaluator mainly uses:
+    The evaluator primarily sends:
 
-        client-name
-        msg
+    {
+        "client-name": "...",
+        "msg": "..."
+    }
     """
 
     global active_requests
@@ -400,7 +375,7 @@ async def http_message(request):
         fernet = request.app["fernet"]
 
         # ----------------------------------------------------
-        # Parse JSON
+        # Parse request JSON
         # ----------------------------------------------------
 
         try:
@@ -419,7 +394,7 @@ async def http_message(request):
             )
 
         # ----------------------------------------------------
-        # Validate required fields
+        # Extract fields
         # ----------------------------------------------------
 
         username = body.get(
@@ -446,12 +421,15 @@ async def http_message(request):
                 status=400,
             )
 
-        if not isinstance(room, str) or not room:
+        if not isinstance(
+            room,
+            str,
+        ) or not room:
 
             room = "general"
 
         # ----------------------------------------------------
-        # Generate message ID once
+        # Generate msg_id once
         # ----------------------------------------------------
 
         msg_id = (
@@ -460,20 +438,24 @@ async def http_message(request):
         )
 
         # ----------------------------------------------------
-        # Create signing key
+        # Get signing key
+        #
+        # This uses the EXISTING chat_handler implementation.
         # ----------------------------------------------------
 
-        signing_key = await get_or_create_signing_key(
-            conn,
-            username,
+        private_key = (
+            await get_or_create_signing_key(
+                conn,
+                username,
+            )
         )
 
         # ----------------------------------------------------
-        # Sign message
+        # Sign plaintext
         # ----------------------------------------------------
 
-        signature = crypto_utils.sign_message(
-            signing_key,
+        signature = crypto_utils.sign_text(
+            private_key,
             plaintext,
         )
 
@@ -481,22 +463,36 @@ async def http_message(request):
         # Verify signature
         # ----------------------------------------------------
 
-        verified = crypto_utils.verify_signature(
-            signing_key,
-            plaintext,
-            signature,
+        public_key = (
+            await get_verifier_public_key(
+                conn,
+                username,
+            )
+        )
+
+        verified = (
+            crypto_utils.verify_signature(
+                public_key,
+                plaintext,
+                signature,
+            )
         )
 
         # ----------------------------------------------------
-        # Encrypt message
+        # Encrypt message for storage
         # ----------------------------------------------------
 
-        ciphertext = fernet.encrypt(
-            plaintext.encode()
-        ).decode()
+        ciphertext = (
+            crypto_utils.encrypt_text(
+                fernet,
+                plaintext,
+            )
+        )
 
         # ----------------------------------------------------
-        # Save locally
+        # LOCAL DATABASE INSERT
+        #
+        # This is the persistence point for /message.
         # ----------------------------------------------------
 
         inserted = await database.save_message(
@@ -511,7 +507,10 @@ async def http_message(request):
         )
 
         # ----------------------------------------------------
-        # Queue replication
+        # QUEUE REPLICATION
+        #
+        # Important:
+        # We do NOT wait for peers here.
         # ----------------------------------------------------
 
         replication_payload = {
@@ -529,7 +528,7 @@ async def http_message(request):
         )
 
         # ----------------------------------------------------
-        # Broadcast locally
+        # Local WebSocket broadcast
         # ----------------------------------------------------
 
         try:
@@ -537,18 +536,15 @@ async def http_message(request):
             await broadcast(
                 room,
                 {
+                    "type": "message",
                     "msg_id": msg_id,
-                    "room": room,
-                    "client-name": username,
-                    "msg": plaintext,
-                    "timestamp": time.time(),
+                    "user": username,
+                    "text": plaintext,
+                    "verified": verified,
                 },
             )
 
         except Exception as exc:
-
-            # Broadcasting should not cause a successful
-            # database write to become a failed HTTP request.
 
             print(
                 "[BROADCAST-WARNING] "
@@ -560,11 +556,6 @@ async def http_message(request):
         # ----------------------------------------------------
         # Return success
         # ----------------------------------------------------
-
-        elapsed = (
-            time.perf_counter()
-            - request_start
-        )
 
         return web.json_response(
             {
@@ -600,21 +591,21 @@ async def http_message(request):
 
 async def http_feed(request):
     """
-    Return recent messages as plaintext.
+    Return recent messages.
 
     IMPORTANT:
-    The evaluator expects the original plaintext message in
-    the "msg" field.
+    The Lab 6 evaluator expects plaintext in "msg".
 
-    No Fernet decryption is performed here because each backend
-    has its own local Fernet key and replicated messages may have
-    been encrypted by another node.
+    Therefore message_text is returned directly.
+
+    ciphertext is retained in the response for compatibility,
+    but the evaluator should use "msg".
     """
 
     conn = request.app["db_conn"]
 
     # --------------------------------------------------------
-    # Read requested limit
+    # Parse limit
     # --------------------------------------------------------
 
     try:
@@ -626,7 +617,10 @@ async def http_feed(request):
             )
         )
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
 
         limit = FEED_DEFAULT_LIMIT
 
@@ -639,16 +633,18 @@ async def http_feed(request):
     )
 
     # --------------------------------------------------------
-    # Load messages
+    # Read database
     # --------------------------------------------------------
 
-    rows = await database.load_recent_messages(
-        conn,
-        limit,
+    rows = (
+        await database.load_recent_messages(
+            conn,
+            limit,
+        )
     )
 
     # --------------------------------------------------------
-    # Convert DB rows to evaluator format
+    # Build evaluator response
     # --------------------------------------------------------
 
     messages = []
@@ -670,14 +666,17 @@ async def http_feed(request):
                 "client-name": sender,
 
                 # IMPORTANT:
-                # Return plaintext directly.
+                # plaintext is what Lab 6 checks.
                 "msg": message_text,
 
                 "ciphertext": ciphertext,
                 "signature": signature,
-                "timestamp": timestamp.isoformat()
-                if timestamp
-                else None,
+
+                "timestamp": (
+                    timestamp.isoformat()
+                    if timestamp
+                    else None
+                ),
             }
         )
 
@@ -693,19 +692,23 @@ async def http_feed(request):
 
 async def internal_replicate(request):
     """
-    Internal endpoint used by backend peers.
+    Receive a replicated message from another backend.
 
-    This endpoint stores a replicated message locally.
+    This endpoint ONLY writes to the local database.
 
-    It DOES NOT replicate the message again.
+    It does NOT enqueue another replication operation.
 
-    That prevents replication loops:
+    Therefore:
+
+        sys2 -> sys3
+
+    stops there rather than becoming:
 
         sys2 -> sys3 -> sys2 -> sys3 -> ...
     """
 
     # --------------------------------------------------------
-    # Authenticate peer
+    # Verify replication secret
     # --------------------------------------------------------
 
     supplied_secret = request.headers.get(
@@ -726,7 +729,7 @@ async def internal_replicate(request):
         )
 
     # --------------------------------------------------------
-    # Parse payload
+    # Parse JSON
     # --------------------------------------------------------
 
     try:
@@ -743,7 +746,7 @@ async def internal_replicate(request):
         )
 
     # --------------------------------------------------------
-    # Extract fields
+    # Extract data
     # --------------------------------------------------------
 
     msg_id = payload.get(
@@ -777,10 +780,11 @@ async def internal_replicate(request):
     )
 
     # --------------------------------------------------------
-    # Validate
+    # Validate required fields
     # --------------------------------------------------------
 
     if not msg_id:
+
         return web.json_response(
             {
                 "error": "msg_id is required"
@@ -789,22 +793,29 @@ async def internal_replicate(request):
         )
 
     if not username:
+
         return web.json_response(
             {
-                "error": "client-name is required"
+                "error": (
+                    "client-name is required"
+                )
             },
             status=400,
         )
 
     if message_text is None:
+
         return web.json_response(
             {
-                "error": "message_text is required"
+                "error": (
+                    "message_text is required"
+                )
             },
             status=400,
         )
 
     if ciphertext is None:
+
         return web.json_response(
             {
                 "error": "ciphertext is required"
@@ -813,6 +824,7 @@ async def internal_replicate(request):
         )
 
     if signature is None:
+
         return web.json_response(
             {
                 "error": "signature is required"
@@ -821,7 +833,9 @@ async def internal_replicate(request):
         )
 
     # --------------------------------------------------------
-    # Save directly to local DB
+    # Save locally
+    #
+    # DO NOT enqueue another replication.
     # --------------------------------------------------------
 
     conn = request.app["db_conn"]
@@ -836,10 +850,6 @@ async def internal_replicate(request):
         signature,
         verified,
     )
-
-    # --------------------------------------------------------
-    # Return success
-    # --------------------------------------------------------
 
     return web.json_response(
         {
@@ -857,12 +867,7 @@ async def internal_replicate(request):
 
 async def health(request):
     """
-    Lightweight health endpoint used by the load balancer.
-
-    Reports:
-        backend ID
-        CPU percentage
-        active request count
+    Health endpoint used by the load balancer.
     """
 
     return web.json_response(
@@ -884,8 +889,14 @@ async def health(request):
 
 async def on_startup(app):
     """
-    Initialize database, Fernet key, replication queue,
-    persistent HTTP session and replication workers.
+    Initialize:
+
+        PostgreSQL pool
+        database tables
+        Fernet key
+        replication queue
+        persistent HTTP session
+        replication workers
     """
 
     global replication_queue
@@ -893,7 +904,7 @@ async def on_startup(app):
     global replication_session
 
     # --------------------------------------------------------
-    # Database pool
+    # PostgreSQL
     # --------------------------------------------------------
 
     db_conn = await database.get_connection()
@@ -905,13 +916,17 @@ async def on_startup(app):
     app["db_conn"] = db_conn
 
     # --------------------------------------------------------
-    # Local Fernet key
+    # Fernet
     # --------------------------------------------------------
 
-    app["fernet"] = Fernet(
+    fernet_key = (
         await database.get_or_create_fernet_key(
             db_conn
         )
+    )
+
+    app["fernet"] = Fernet(
+        fernet_key
     )
 
     # --------------------------------------------------------
@@ -921,26 +936,28 @@ async def on_startup(app):
     replication_queue = asyncio.Queue()
 
     # --------------------------------------------------------
-    # Persistent HTTP client
+    # Persistent HTTP connection pool
     # --------------------------------------------------------
 
-    replication_connector = aiohttp.TCPConnector(
+    connector = aiohttp.TCPConnector(
         limit=0,
         limit_per_host=100,
         keepalive_timeout=60,
     )
 
-    replication_timeout = aiohttp.ClientTimeout(
+    timeout = aiohttp.ClientTimeout(
         total=REPLICATION_TIMEOUT_SECONDS
     )
 
-    replication_session = aiohttp.ClientSession(
-        connector=replication_connector,
-        timeout=replication_timeout,
+    replication_session = (
+        aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+        )
     )
 
     # --------------------------------------------------------
-    # Start replication workers
+    # Start workers
     # --------------------------------------------------------
 
     replication_workers.clear()
@@ -959,22 +976,35 @@ async def on_startup(app):
             task
         )
 
+    # --------------------------------------------------------
+    # Startup diagnostics
+    # --------------------------------------------------------
+
     print(
-        f"[STARTUP] "
-        f"backend={BACKEND_ID} "
-        f"port={PORT}"
+        f"[STARTUP] backend={BACKEND_ID}"
     )
 
     print(
-        f"[STARTUP] "
-        f"replication peers="
+        f"[STARTUP] host={HOST}"
+    )
+
+    print(
+        f"[STARTUP] port={PORT}"
+    )
+
+    print(
+        f"[STARTUP] replication_peers="
         f"{REPLICATION_PEERS}"
     )
 
     print(
-        f"[STARTUP] "
-        f"replication workers="
+        f"[STARTUP] replication_workers="
         f"{REPLICATION_WORKERS}"
+    )
+
+    print(
+        f"[STARTUP] replication_timeout="
+        f"{REPLICATION_TIMEOUT_SECONDS}s"
     )
 
 
@@ -984,19 +1014,18 @@ async def on_startup(app):
 
 async def on_cleanup(app):
     """
-    Gracefully stop replication workers, close HTTP session,
-    and close the PostgreSQL pool.
+    Stop replication workers and close network/database
+    resources.
     """
 
     global replication_workers
     global replication_session
 
     # --------------------------------------------------------
-    # Stop replication workers
+    # Stop workers
     # --------------------------------------------------------
 
     for task in replication_workers:
-
         task.cancel()
 
     if replication_workers:
@@ -1009,7 +1038,7 @@ async def on_cleanup(app):
     replication_workers.clear()
 
     # --------------------------------------------------------
-    # Close replication HTTP session
+    # Close HTTP session
     # --------------------------------------------------------
 
     if replication_session is not None:
@@ -1019,7 +1048,7 @@ async def on_cleanup(app):
         replication_session = None
 
     # --------------------------------------------------------
-    # Close DB
+    # Close PostgreSQL
     # --------------------------------------------------------
 
     db_conn = app.get(
@@ -1032,17 +1061,17 @@ async def on_cleanup(app):
 
 
 # ============================================================
-# APPLICATION FACTORY
+# APPLICATION
 # ============================================================
 
 def create_app():
     """
-    Create and configure the aiohttp application.
+    Create aiohttp application.
     """
 
     app = web.Application()
 
-    # Startup / cleanup
+    # Lifecycle
     app.on_startup.append(
         on_startup
     )
@@ -1051,7 +1080,7 @@ def create_app():
         on_cleanup
     )
 
-    # Public routes
+    # Public API
     app.router.add_get(
         "/",
         index,
@@ -1077,7 +1106,7 @@ def create_app():
         websocket_handler,
     )
 
-    # Internal replication route
+    # Internal replication
     app.router.add_post(
         "/internal/replicate",
         internal_replicate,
