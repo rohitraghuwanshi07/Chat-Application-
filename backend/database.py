@@ -187,7 +187,7 @@ async def load_recent_messages(pool, limit=1000):
     The limit prevents /feed from materializing an unbounded number of
     rows in backend memory.
     """
-    limit = max(1, min(int(limit), 5000))
+    limit = max(1, min(int(limit), 100000))
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(

@@ -59,7 +59,7 @@ REPLICATION_TIMEOUT_SECONDS = float(
 )
 
 FEED_DEFAULT_LIMIT = int(
-    os.environ.get("FEED_DEFAULT_LIMIT", "1000")
+    os.environ.get("FEED_DEFAULT_LIMIT", "100000")
 )
 
 FRONTEND_DIR = (
@@ -425,8 +425,7 @@ async def http_replicate(request):
             {
                 "type": "message",
                 "user": body["client-name"],
-                # Current /feed behavior exposes ciphertext as msg.
-                # Keep the same behavior for WebSocket compatibility.
+                 # Broadcast the original plaintext to local WebSocket clients.
                 "text": body["message_text"],
                 "verified": bool(body["verified"]),
             },
@@ -465,14 +464,14 @@ async def http_feed(request):
     except ValueError:
         limit = FEED_DEFAULT_LIMIT
 
-    limit = max(1, min(limit, 5000))
+    limit = max(1, min(limit, 100000))
 
     rows = await database.load_recent_messages(
         conn,
         limit,
     )
 
-# Return the original plaintext message in the public feed.
+    # Return the original plaintext message in the public feed.
     out = []
 
     for (
