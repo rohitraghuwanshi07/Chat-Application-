@@ -172,8 +172,8 @@ async def get_cached_feed(limit):
 
     messages.sort(
         key=lambda item: (
-            item.get("timestamp") or "",
-            item.get("msg_id") or "",
+            str(item.get("timestamp") or ""),
+            str(item.get("msg_id") or ""),
         ),
         reverse=True,
     )

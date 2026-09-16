@@ -70,11 +70,11 @@ async def get_connection():
 
         # Small minimum pool avoids unnecessary idle
         # PostgreSQL connections.
-        min_size=2,
+        min_size=5,
 
         # Allows concurrent HTTP requests and replication
         # operations to use separate DB connections.
-        max_size=10,
+        max_size=20,
     )
 
 
