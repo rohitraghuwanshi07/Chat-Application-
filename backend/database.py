@@ -74,7 +74,7 @@ async def get_connection():
 
         # Allows concurrent HTTP requests and replication
         # operations to use separate DB connections.
-        max_size=30,
+        max_size=10,
     )
 
 

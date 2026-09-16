@@ -139,7 +139,7 @@ async def websocket_handler(request):
                 verified = crypto_utils.verify_signature(public_key, plaintext, signature)
 
                 ciphertext = crypto_utils.encrypt_text(fernet, plaintext)
-                await database.save_message(conn, msg_id, room, username, ciphertext, signature, verified)
+                await database.save_message(conn, msg_id, room, username, plaintext,ciphertext, signature, verified)
 
                 print(f"[{room}] {username} ({timestamp}): signed & encrypted, verified={verified}")
 
