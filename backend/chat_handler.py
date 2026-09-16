@@ -15,6 +15,7 @@ import database
 
 rooms = {}
 signing_keys = {}
+public_signing_keys = {}
 
 
 async def get_or_create_signing_key(conn, username):
@@ -39,12 +40,33 @@ async def get_or_create_signing_key(conn, username):
     return private_key
 
 
+# async def get_verifier_public_key(conn, username):
+#     row = await database.load_signing_key(conn, username)
+#     if not row:
+#         return None
+#     public_pem, _ = row
+#     return crypto_utils.pem_to_public_key(public_pem)
 async def get_verifier_public_key(conn, username):
-    row = await database.load_signing_key(conn, username)
+    if username in public_signing_keys:
+        return public_signing_keys[username]
+
+    row = await database.load_signing_key(
+        conn,
+        username,
+    )
+
     if not row:
         return None
+
     public_pem, _ = row
-    return crypto_utils.pem_to_public_key(public_pem)
+
+    public_key = crypto_utils.pem_to_public_key(
+        public_pem
+    )
+
+    public_signing_keys[username] = public_key
+
+    return public_key
 
 
 async def broadcast(room, payload, exclude=None):
